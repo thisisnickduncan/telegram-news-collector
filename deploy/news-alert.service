@@ -1,0 +1,14 @@
+[Unit]
+Description=News Alert Telegram Bot
+After=network.target
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/news-alert/venv/bin/python /opt/news-alert/news_alert/bot_runner.py
+WorkingDirectory=/opt/news-alert
+Restart=always
+RestartSec=5
+User=opc
+
+[Install]
+WantedBy=multi-user.target
