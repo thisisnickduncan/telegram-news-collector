@@ -34,9 +34,19 @@ def run():
         tagged = tag_untagged_sources(cur)
     print(f"[pipeline] Tagged {tagged} sources with bias ratings.")
 
-    print("[pipeline] Summarizing new stories...")
+    # Only summarize what the digest will actually show. compose_digest() picks the
+    # same slice -- sorted new story ids, capped at digest_max_stories -- so this must
+    # stay in step with it. Followed-story updates are included because an update line
+    # reuses the story's existing summary, which may be missing if an earlier run
+    # skipped it.
+    new_story_ids = sorted({r["story_id"] for r in results if r["action"] == "new"})
+    update_story_ids = sorted({r["story_id"] for r in results if r["action"] == "update"})
+    shown = new_story_ids[:prefs["digest_max_stories"]]
+
+    print(f"[pipeline] Summarizing {len(shown)} shown + {len(update_story_ids)} followed "
+          f"(of {len(new_story_ids)} new stories)...")
     with db_cursor() as cur:
-        summarized = summarize_pending_stories(cur)
+        summarized = summarize_pending_stories(cur, story_ids=shown + update_story_ids)
     print(f"[pipeline] Summarized {summarized} stories.")
 
     with db_cursor() as cur:
@@ -50,8 +60,6 @@ def run():
     sent = send_message(prefs["telegram_chat_id"], digest["text"], reply_markup=digest["reply_markup"])
     print(f"[pipeline] Sent. message_id={sent['message_id']}")
 
-    new_story_ids = sorted({r["story_id"] for r in results if r["action"] == "new"})
-    shown = new_story_ids[:prefs["digest_max_stories"]]
     with db_cursor() as cur:
         for story_id in shown:
             cur.execute(

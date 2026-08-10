@@ -20,11 +20,14 @@ from apscheduler.triggers.cron import CronTrigger
 import news_alert.pipeline as pipeline
 from news_alert.bias import refresh_bias_data
 from news_alert.callback_handler import handle_callback_query
+from news_alert.config import DISPLAY_TIMEZONE
 from news_alert.db import db_cursor, get_preferences
 from news_alert.message_handler import handle_message
 from news_alert.telegram_client import get_updates, safe_call, send_message
 
-SCHEDULE_TIMEZONE = "America/Los_Angeles"
+# Same zone the digest timestamps use -- keeping these in sync matters: a digest
+# scheduled in one zone and labeled in another is how "8:00pm" became "3:26am".
+SCHEDULE_TIMEZONE = DISPLAY_TIMEZONE
 SCHEDULE_HOURS = "0,4,8,12,16,20"  # every 4 hours, on the dot, Pacific time (DST-aware)
 BIAS_REFRESH_DAY = 1        # 1st of each month
 BIAS_REFRESH_HOUR = 3       # 3am Pacific -- clear of the 4-hour digest slots (0/4/8/12/16/20)

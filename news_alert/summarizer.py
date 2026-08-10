@@ -51,14 +51,30 @@ def summarize_story(headline, source_titles, client=None):
     return text
 
 
-def summarize_pending_stories(cur, client=None):
-    """Summarizes every story with summary IS NULL -- i.e. newly created this run.
+def summarize_pending_stories(cur, client=None, story_ids=None):
+    """Summarizes stories with summary IS NULL -- i.e. newly created this run.
 
     Stories that already have a summary (matched an existing story) are left as-is;
     digest.py's "update" line reuses the existing summary rather than regenerating it.
+
+    story_ids narrows the work to the stories that will actually appear in this digest.
+    A single run can create dozens of stories while the digest shows only
+    digest_max_stories of them -- one observed run summarized 42 to display 8, i.e. 34
+    Claude calls nobody would ever read. Pass None to summarize every pending story.
+    Anything left unsummarized still renders: digest.py falls back to the headline.
     """
     client = client or anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    cur.execute("SELECT id, headline FROM stories WHERE summary IS NULL")
+
+    if story_ids is None:
+        cur.execute("SELECT id, headline FROM stories WHERE summary IS NULL")
+    elif not story_ids:
+        return 0
+    else:
+        placeholders = ",".join("?" * len(story_ids))
+        cur.execute(
+            f"SELECT id, headline FROM stories WHERE summary IS NULL AND id IN ({placeholders})",
+            tuple(story_ids),
+        )
     pending = cur.fetchall()
 
     for story in pending:

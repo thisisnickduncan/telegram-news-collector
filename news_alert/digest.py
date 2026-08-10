@@ -6,11 +6,13 @@ import html
 import sys
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from news_alert.bias import story_bias_spread
+from news_alert.config import DISPLAY_TIMEZONE
 
 
 def _format_time(now):
@@ -72,7 +74,9 @@ def compose_digest(cur, dedupe_results, max_stories=6, now=None):
     shown_new = new_ids[:max_stories]
     overflow = len(new_ids) - len(shown_new)
 
-    now = now or datetime.now()
+    # Must be timezone-aware: the server runs on UTC, so a naive now() would label
+    # the 8:00pm Pacific digest "3:00am".
+    now = now or datetime.now(ZoneInfo(DISPLAY_TIMEZONE))
     update_word = "update" if len(update_ids) == 1 else "updates"
     intro = (
         "\U0001F44B Here's what's happening in your tracked topics -- tap Ask on any "

@@ -1,11 +1,22 @@
-"""GDELT DOC 2.0 API pull, region-aware.
+"""GDELT DOC 2.0 API pull against https://api.gdeltproject.org/api/v2/doc/doc.
 
-One query per (topic, region) pair against https://api.gdeltproject.org/api/v2/doc/doc.
-Region filtering uses GDELT's `sourcecountry:` operator, which takes FIPS 10-4
-two-letter codes (NOT ISO 3166 -- e.g. Germany is GM, not DE; Australia is AS, not AU).
-Only a small, deliberately incomplete set of countries is mapped below. A region that
-isn't a recognized country (e.g. "Your Town", a US city) is folded into the query as a
-plain keyword term instead of guessed at as a country code -- narrower results, but
+Two kinds of search, run independently rather than crossed with each other:
+
+  * one per tracked topic, with NO country filter -- you want the story wherever
+    it breaks;
+  * one per place in preferences.regions, searched on its own name, to pick up
+    local news.
+
+Crossing the two (the original design) meant 4 topics x 3 regions = 12 queries, most
+of them meaningless -- '"Iran war" Hawaii' and the like. Since GDELT rate-limits
+aggressively, each of those still burned a full retry cycle to return nothing; one
+run took 26 minutes end to end. See fetch_all.
+
+Country filtering, where it applies, uses GDELT's `sourcecountry:` operator, which
+takes FIPS 10-4 two-letter codes (NOT ISO 3166 -- Germany is GM, not DE; Australia is
+AS, not AU). Only a small, deliberately incomplete set of countries is mapped below.
+A place that isn't a recognized country (e.g. "Hawaii", a US state) stays a plain
+keyword search instead of being guessed at as a country code -- narrower results, but
 not silently wrong. See plan section 11 for the same philosophy applied to bias ratings.
 """
 import time
@@ -41,44 +52,65 @@ COUNTRY_FIPS = {
 }
 
 
-def _build_query(topic, region, keywords=None, excluded_sources=None):
-    terms = [f'"{topic}"' if " " in topic else topic]
-    if keywords:
+def _label(term, region):
+    """How a single search is named in logs -- places and topics are distinct searches."""
+    return f"place={term!r}" if region else f"topic={term!r}"
+
+
+def _build_query(term, region=None, keywords=None, excluded_sources=None):
+    """Builds one GDELT query for a single search term.
+
+    `term` is either a tracked topic -- searched worldwide, with no country filter, so
+    a story is caught wherever it breaks -- or a place from preferences.regions,
+    searched on its own name. Topics and places are deliberately never crossed with
+    each other; see fetch_all for why.
+    """
+    terms = [f'"{term}"' if " " in term else term]
+    # Keywords narrow a topic search. They're left off place searches, which are
+    # already narrow -- ANDing extra terms onto "Hawaii" mostly returns nothing.
+    if keywords and not region:
         terms.extend(keywords)
 
-    fips = None
-    region_upper = (region or "").strip().upper()
-    if region_upper and region_upper != GLOBAL_REGION:
-        fips = COUNTRY_FIPS.get(region_upper)
-        if fips is None:
-            terms.append(region)
-
     query = " ".join(terms)
-    if fips:
-        query += f" sourcecountry:{fips}"
+
+    # A place that's a recognized country can additionally be pinned to that country's
+    # outlets. Anything smaller (a state, a city) has no FIPS code and stays a plain
+    # keyword search rather than being guessed at.
+    if region:
+        fips = COUNTRY_FIPS.get(region.strip().upper())
+        if fips:
+            query += f" sourcecountry:{fips}"
+
     for domain in excluded_sources or []:
         query += f" -domainis:{domain}"
     return query
 
 
-def _get_with_retry(http, params, topic, region):
+def _get_with_retry(http, params, label):
     """GDELT 429s in practice even at conservative request rates -- back off and retry."""
     resp = http.get(GDELT_URL, params=params, timeout=30)
     attempt = 0
     while resp.status_code == 429 and attempt < MAX_RETRIES:
         attempt += 1
         wait = RETRY_BACKOFF_SECONDS * attempt
-        print(f"[fetcher] 429 for topic={topic!r} region={region!r}, "
-              f"retry {attempt}/{MAX_RETRIES} in {wait:.0f}s")
+        print(f"[fetcher] 429 for {label}, retry {attempt}/{MAX_RETRIES} in {wait:.0f}s")
         time.sleep(wait)
         resp = http.get(GDELT_URL, params=params, timeout=30)
     return resp
 
 
-def fetch_articles(topic, region, keywords=None, excluded_sources=None,
+def fetch_articles(term, region=None, keywords=None, excluded_sources=None,
                     max_records=75, timespan="6h", session=None):
-    """Hits GDELT for a single (topic, region) pair. Returns a list of dicts."""
-    query = _build_query(topic, region, keywords, excluded_sources)
+    """Hits GDELT for a single search term. Returns a list of dicts.
+
+    `region` is set only for place searches; topic searches leave it None and their
+    articles are labeled GLOBAL_REGION, since they're deliberately country-unfiltered.
+
+    Every article carries a non-null `topic`, which dedupe.py uses to scope story
+    matching -- for a place search that bucket is the place name itself, so local
+    stories cluster with each other rather than with world news.
+    """
+    query = _build_query(term, region, keywords, excluded_sources)
     params = {
         "query": query,
         "mode": "ArtList",
@@ -87,13 +119,13 @@ def fetch_articles(topic, region, keywords=None, excluded_sources=None,
         "timespan": timespan,
     }
     http = session or requests
-    resp = _get_with_retry(http, params, topic, region)
+    resp = _get_with_retry(http, params, _label(term, region))
     resp.raise_for_status()
 
     try:
         data = resp.json()
     except ValueError:
-        print(f"[fetcher] non-JSON response for topic={topic!r} region={region!r} "
+        print(f"[fetcher] non-JSON response for {_label(term, region)} "
               f"query={query!r} -- skipping")
         return []
 
@@ -105,41 +137,51 @@ def fetch_articles(topic, region, keywords=None, excluded_sources=None,
             "domain": article.get("domain"),
             "seendate": article.get("seendate"),
             "sourcecountry": article.get("sourcecountry"),
-            "topic": topic,
-            "region": region,
+            "topic": term,
+            "region": region or GLOBAL_REGION,
         })
     return results
 
 
 def fetch_all(preferences, max_records=75, timespan="6h"):
-    """preferences: dict with topics/regions/keywords/excluded_sources (see news_alert.db.get_preferences)."""
-    topics = preferences["topics"]
-    regions = preferences["regions"] or [GLOBAL_REGION]
+    """preferences: dict with topics/regions/keywords/excluded_sources (see news_alert.db.get_preferences).
+
+    Issues one query per topic plus one per place -- NOT the cross-product of the two.
+    Crossing them was the original design and it was both slow and useless: it turned
+    4 topics x 3 regions into 12 queries, most of them nonsense like '"Iran war" Hawaii',
+    and since GDELT rate-limits hard, each doomed query still burned a full retry cycle
+    (~2 minutes) to return nothing. One 8pm run took 26 minutes to send.
+
+    Topics are queried first, on purpose: they're the broad, high-value searches, and
+    GDELT gets progressively stingier as a run goes on, so they should spend the
+    rate-limit budget while it's still there.
+    """
+    topics = preferences["topics"] or []
+    regions = preferences["regions"] or []
     keywords = preferences.get("keywords") or []
     excluded_sources = preferences.get("excluded_sources") or []
 
+    searches = [(topic, None) for topic in topics] + [(region, region) for region in regions]
+
     all_articles = []
-    first_request = True
-    for topic in topics:
-        for region in regions:
-            if not first_request:
-                time.sleep(REQUEST_DELAY_SECONDS)
-            first_request = False
+    for i, (term, region) in enumerate(searches):
+        if i:
+            time.sleep(REQUEST_DELAY_SECONDS)
 
-            try:
-                articles = fetch_articles(
-                    topic, region,
-                    keywords=keywords,
-                    excluded_sources=excluded_sources,
-                    max_records=max_records,
-                    timespan=timespan,
-                )
-            except requests.RequestException as exc:
-                print(f"[fetcher] request failed for topic={topic!r} region={region!r}: {exc}")
-                continue
+        try:
+            articles = fetch_articles(
+                term, region=region,
+                keywords=keywords,
+                excluded_sources=excluded_sources,
+                max_records=max_records,
+                timespan=timespan,
+            )
+        except requests.RequestException as exc:
+            print(f"[fetcher] request failed for {_label(term, region)}: {exc}")
+            continue
 
-            print(f"[fetcher] topic={topic!r} region={region!r} -> {len(articles)} articles")
-            all_articles.extend(articles)
+        print(f"[fetcher] {_label(term, region)} -> {len(articles)} articles")
+        all_articles.extend(articles)
 
     return all_articles
 
