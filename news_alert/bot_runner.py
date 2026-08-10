@@ -9,7 +9,9 @@ background thread for the cron job needs no async rewrite of the rest of the bot
 """
 import sys
 import traceback
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,7 +30,19 @@ from news_alert.telegram_client import get_updates, safe_call, send_message
 # Same zone the digest timestamps use -- keeping these in sync matters: a digest
 # scheduled in one zone and labeled in another is how "8:00pm" became "3:26am".
 SCHEDULE_TIMEZONE = DISPLAY_TIMEZONE
-SCHEDULE_HOURS = "0,4,8,12,16,20"  # every 4 hours, on the dot, Pacific time (DST-aware)
+
+# When digests should ARRIVE (Pacific, DST-aware) -- not when the job starts.
+SEND_HOURS = (0, 4, 8, 12, 16, 20)
+
+# How early to start so the digest can still land exactly on the hour. The fetch is
+# the variable part: GDELT answers in ~12s whether it says yes or no, and 429s enough
+# that a query can need all 7 attempts, so a run measured anywhere from ~1 to ~13
+# minutes. 15 covers the measured worst case with margin; the finished digest then
+# waits out the remainder (see pipeline._hold_until), making arrival exact regardless
+# of which way the fetch went. Must stay under 60 -- _pipeline_trigger() assumes the
+# job fires in the hour before the send hour.
+LEAD_MINUTES = 15
+
 BIAS_REFRESH_DAY = 1        # 1st of each month
 BIAS_REFRESH_HOUR = 3       # 3am Pacific -- clear of the 4-hour digest slots (0/4/8/12/16/20)
 
@@ -44,10 +58,30 @@ def _alert_failure(context, exc_info_printed=True):
                   f"news-alert {context} failed, check logs.", parse_mode=None)
 
 
+def _pipeline_trigger():
+    """Fires LEAD_MINUTES before each send hour, so the run has time to finish."""
+    if not 0 < LEAD_MINUTES < 60:
+        raise ValueError(f"LEAD_MINUTES must be between 1 and 59, got {LEAD_MINUTES}")
+    hours = ",".join(str((h - 1) % 24) for h in sorted(SEND_HOURS))
+    return CronTrigger(hour=hours, minute=60 - LEAD_MINUTES, timezone=SCHEDULE_TIMEZONE)
+
+
+def _target_send_time(now):
+    """The send slot this run is working toward -- the top of the upcoming hour.
+
+    Derived by adding the lead to `now` rather than searching SEND_HOURS, so it stays
+    correct when a misfire makes the job start late: a run that starts at 19:50
+    instead of 19:45 still targets 20:00, and pipeline sends immediately if that has
+    already passed by the time the digest is ready.
+    """
+    return (now + timedelta(minutes=LEAD_MINUTES)).replace(minute=0, second=0, microsecond=0)
+
+
 def run_scheduled_pipeline():
-    print("[bot_runner] scheduled pipeline run starting...")
+    send_at = _target_send_time(datetime.now(ZoneInfo(SCHEDULE_TIMEZONE)))
+    print(f"[bot_runner] scheduled pipeline run starting, targeting {send_at:%Y-%m-%d %H:%M:%S %Z}...")
     try:
-        pipeline.run()
+        pipeline.run(send_at=send_at)
         print("[bot_runner] scheduled pipeline run finished.")
     except Exception:
         print("[bot_runner] scheduled pipeline run FAILED:")
@@ -71,17 +105,22 @@ def start_scheduler():
     # misfire_grace_time: if the process was briefly down (restart, deploy) right at
     # the scheduled minute, still fire if we come back within a reasonable window rather
     # than silently skipping that cycle entirely.
-    pipeline_trigger = CronTrigger(hour=SCHEDULE_HOURS, minute=0, timezone=SCHEDULE_TIMEZONE)
-    scheduler.add_job(run_scheduled_pipeline, pipeline_trigger, id="pipeline_4h", misfire_grace_time=300)
+    scheduler.add_job(run_scheduled_pipeline, _pipeline_trigger(), id="pipeline_4h",
+                      misfire_grace_time=300)
 
     bias_trigger = CronTrigger(day=BIAS_REFRESH_DAY, hour=BIAS_REFRESH_HOUR, minute=0,
                                 timezone=SCHEDULE_TIMEZONE)
     scheduler.add_job(run_bias_refresh, bias_trigger, id="bias_refresh_monthly", misfire_grace_time=3600)
 
     scheduler.start()
-    for job_id in ("pipeline_4h", "bias_refresh_monthly"):
-        job = scheduler.get_job(job_id)
-        print(f"[bot_runner] scheduler started: {job_id} next run: {job.next_run_time}")
+    # The pipeline job's next_run_time is the LEAD_MINUTES-early start, not the delivery
+    # time, so print both -- otherwise the log looks like the schedule has slipped.
+    pipeline_job = scheduler.get_job("pipeline_4h")
+    print(f"[bot_runner] scheduler started: pipeline_4h next run: {pipeline_job.next_run_time} "
+          f"(delivers {_target_send_time(pipeline_job.next_run_time):%H:%M:%S %Z}, "
+          f"{LEAD_MINUTES}min lead)")
+    bias_job = scheduler.get_job("bias_refresh_monthly")
+    print(f"[bot_runner] scheduler started: bias_refresh_monthly next run: {bias_job.next_run_time}")
     return scheduler
 
 
