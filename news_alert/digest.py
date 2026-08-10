@@ -24,6 +24,26 @@ from news_alert.sources import independent_sources
 
 MAX_SOURCE_LINKS = 4
 
+# Only these become <a href> targets. GDELT supplies the urls, so without this the
+# thing we point anchor tags at is decided by an upstream API we don't control.
+# Telegram happens not to linkify javascript:/data: hrefs, which makes this
+# defense-in-depth rather than a live hole -- but "our HTML is safe because the
+# renderer is picky" is a property of Telegram, not of this code.
+SAFE_URL_SCHEMES = ("http://", "https://")
+
+
+def _safe_url(url):
+    """The url to link to, or None if it isn't a plain web address.
+
+    Leading whitespace is stripped before the scheme test: HTML tolerates (and ignores)
+    it inside an attribute, so " javascript:..." would pass a naive startswith check and
+    still resolve as a script url.
+    """
+    if not isinstance(url, str):
+        return None
+    cleaned = url.strip()
+    return cleaned if cleaned.lower().startswith(SAFE_URL_SCHEMES) else None
+
 FOLLOW_UP_PROMPT = (
     "\U0001F5E3 Which of these do you want deeper coverage on next time?\n"
     "Just reply naming them however you like -- \"the Iran one and the cyber story\" is "
@@ -53,7 +73,7 @@ def _pick_sources(rows):
     show you the spread rather than four flavors of the same take. Unrated outlets are
     eligible here (they just don't vote on the coverage math) and fill remaining slots.
     """
-    linkable = [row for row in rows if row["url"] and row["domain"]]
+    linkable = [row for row in rows if _safe_url(row["url"]) and row["domain"]]
     reports = independent_sources(linkable)
     total = len(reports)
 
@@ -90,7 +110,7 @@ def _source_links(cur, story_id):
     links = []
     for row in picked:
         label = row["outlet_name"] or row["domain"]
-        href = html.escape(row["url"], quote=True)
+        href = html.escape(_safe_url(row["url"]), quote=True)
         links.append(f'<a href="{href}">{_escape(label)}</a>')
 
     line = " · ".join(links)

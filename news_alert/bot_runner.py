@@ -124,6 +124,50 @@ def start_scheduler():
     return scheduler
 
 
+def _update_chat_id(update):
+    """The chat an update arrived from, whichever kind of update it is."""
+    if "callback_query" in update:
+        container = (update.get("callback_query") or {}).get("message") or {}
+    else:
+        container = update.get("message") or {}
+    return (container.get("chat") or {}).get("id")
+
+
+def _update_actor_id(update):
+    """The user who sent the message or pressed the button -- logged on a rejection so
+    a repeated prober is identifiable; not used for the decision itself."""
+    source = update.get("callback_query") or update.get("message") or {}
+    return (source.get("from") or {}).get("id")
+
+
+def _authorized(update):
+    """Whether an update came from the one chat this bot belongs to.
+
+    A Telegram bot is a public endpoint -- anyone who finds its @name can message it,
+    and every handler past this point acts as though the sender were the owner: a plain
+    message can reach the Sonnet + web-search path with no ceiling on cost, permanently
+    append to the tracked topics, or queue deep dives that steer the owner's next
+    digest. So the poller drops foreign updates before dispatching anything.
+
+    Fails closed on purpose. If no chat id is registered there is no owner to compare
+    against, so nothing is authorized -- run scripts/register_bot.py to set one. That
+    script does its own polling and is unaffected by this check.
+    """
+    prefs = get_preferences()
+    owner = (prefs or {}).get("telegram_chat_id")
+    chat_id = _update_chat_id(update)
+
+    # Telegram sends ids as ints and the column is TEXT -- compared raw, every single
+    # update would look unauthorized.
+    if owner and chat_id is not None and str(owner).strip() == str(chat_id):
+        return True
+
+    print(f"[bot_runner] DROPPED update {update.get('update_id')} from unauthorized "
+          f"chat_id={chat_id!r} user_id={_update_actor_id(update)!r} "
+          f"(owner chat id {'is not set' if not owner else 'does not match'})")
+    return False
+
+
 def run(max_iterations=None):
     """max_iterations bounds the loop for manual testing; leave None for the real
     always-on process (systemd will restart it if it ever exits)."""
@@ -133,6 +177,10 @@ def run(max_iterations=None):
         updates = get_updates(offset=offset, timeout=30)
         for update in updates:
             offset = update["update_id"] + 1
+            # Before the raw dump below: an unauthorized update's contents don't belong
+            # in the log either.
+            if not _authorized(update):
+                continue
             print(f"[bot_runner] update {update['update_id']}: keys={list(update.keys())} raw={update}")
             try:
                 if "callback_query" in update:
