@@ -32,15 +32,28 @@ def _call(method, timeout=30, **params):
     return data["result"]
 
 
-def send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
+def send_message(chat_id, text, reply_markup=None, parse_mode="HTML",
+                 disable_notification=False, disable_web_page_preview=True):
     """parse_mode="HTML" requires the caller to have HTML-escaped `text` (digest.py does).
     Pass parse_mode=None for arbitrary/generated text (e.g. a Claude Q&A answer) that
-    hasn't been escaped -- sending it as HTML would break on a stray < > &."""
-    params = {"chat_id": chat_id, "text": text}
+    hasn't been escaped -- sending it as HTML would break on a stray < > &.
+
+    disable_web_page_preview defaults True: story messages carry several source links,
+    and Telegram would otherwise expand the first one into a full preview card, burying
+    the digest under images. disable_notification lets a multi-message digest ping the
+    phone once (on the header) instead of once per story.
+    """
+    params = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": disable_web_page_preview,
+    }
     if parse_mode:
         params["parse_mode"] = parse_mode
     if reply_markup is not None:
         params["reply_markup"] = reply_markup
+    if disable_notification:
+        params["disable_notification"] = True
     return _call("sendMessage", **params)
 
 

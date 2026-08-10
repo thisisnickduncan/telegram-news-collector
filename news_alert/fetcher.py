@@ -41,6 +41,19 @@ MAX_RETRIES = 6
 RETRY_BACKOFF_SECONDS = 6.0
 GLOBAL_REGION = "GLOBAL"
 
+# GDELT's per-query ceiling is 250; we asked for 75. Raising it is free in the only
+# currency that matters here -- it's the same number of HTTP requests, the same retry
+# budget, the same saturation exposure, just a fuller response body.
+#
+# It matters because the digest now requires two independent outlets before it will
+# show a story. Corroboration density is a function of how deeply each topic is
+# sampled: at 75 records per topic, measured against the live database, only 8.5% of
+# stories ever reached two distinct domains, because we were seeing the top slice of
+# many events rather than several reports of the same one. Loosening the dedupe
+# threshold does NOT fix that (measured: 80 -> 55 moved it 8% -> 17%, while inviting
+# false merges); sampling deeper does.
+MAX_RECORDS = 250
+
 # FIPS 10-4 country codes for GDELT's sourcecountry: operator.
 COUNTRY_FIPS = {
     "US": "US", "UNITED STATES": "US",
@@ -116,7 +129,7 @@ def _get_with_retry(http, params, label):
 
 
 def fetch_articles(term, region=None, keywords=None, excluded_sources=None,
-                    max_records=75, timespan="6h", session=None):
+                    max_records=MAX_RECORDS, timespan="6h", session=None):
     """Hits GDELT for a single search term. Returns a list of dicts.
 
     `region` is set only for place searches; topic searches leave it None and their
@@ -159,7 +172,7 @@ def fetch_articles(term, region=None, keywords=None, excluded_sources=None,
     return results
 
 
-def fetch_all(preferences, max_records=75, timespan="6h"):
+def fetch_all(preferences, max_records=MAX_RECORDS, timespan="6h"):
     """preferences: dict with topics/regions/keywords/excluded_sources (see news_alert.db.get_preferences).
 
     Issues one query per topic plus one per place -- NOT the cross-product of the two.

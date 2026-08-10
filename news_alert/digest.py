@@ -1,6 +1,13 @@
-"""Digest composition: turn one run's dedupe results into a Telegram message.
-Plan sections 5.5 / 6. No telegram_client calls here -- this just builds
-{"text", "reply_markup"}; telegram_client.send_message() does the sending (phase 4).
+"""Digest composition: turn a run's eligible stories into Telegram messages.
+
+Returns a LIST of messages, not one. Telegram attaches an inline keyboard to the
+bottom of a whole message -- there is no way to put buttons between two blocks of text
+in a single message -- so "Follow/Ask directly under each story" necessarily means one
+message per story. That's also what lets the numbering go away: a button that lives
+under its own story doesn't need "#3" to say which story it belongs to.
+
+Message order: header, then one per story, then the follow-up prompt.
+No telegram_client calls here -- this just builds the payloads; pipeline.py sends them.
 """
 import html
 import sys
@@ -11,8 +18,18 @@ from zoneinfo import ZoneInfo
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from news_alert.bias import story_bias_spread
+from news_alert.bias import LEAN_BUCKET, story_coverage
 from news_alert.config import DISPLAY_TIMEZONE
+from news_alert.sources import independent_sources
+
+MAX_SOURCE_LINKS = 4
+
+FOLLOW_UP_PROMPT = (
+    "\U0001F5E3 Which of these do you want deeper coverage on next time?\n"
+    "Just reply naming them however you like -- \"the Iran one and the cyber story\" is "
+    "fine. No rush: whenever you get to it, I'll pick it up and lead the next digest "
+    "with them."
+)
 
 
 def _format_time(now):
@@ -23,129 +40,231 @@ def _format_time(now):
 
 def _escape(text):
     # quote=False: Telegram's HTML mode only requires escaping & < > -- escaping quotes
-    # too (html.escape's default) renders literal "&#x27;" for every apostrophe.
-    return html.escape(text, quote=False)
+    # too (html.escape's default) renders a literal "&#x27;" for every apostrophe.
+    return html.escape(str(text or ""), quote=False)
 
 
-def _story_line(cur, story_id, index):
-    cur.execute("SELECT headline, summary FROM stories WHERE id = ?", (story_id,))
-    story = cur.fetchone()
-    spread = story_bias_spread(cur, story_id)
-    tag = "/".join(spread) if spread else "Unrated"
+def _pick_sources(rows):
+    """Up to MAX_SOURCE_LINKS links for one story, one per independent report.
 
+    Syndicated copies collapse to a single entry first, so four links are four different
+    newsrooms rather than four affiliates of one. Then picks for lean diversity -- one
+    from each of Left/Center/Right before taking a second from any side -- so the links
+    show you the spread rather than four flavors of the same take. Unrated outlets are
+    eligible here (they just don't vote on the coverage math) and fill remaining slots.
+    """
+    linkable = [row for row in rows if row["url"] and row["domain"]]
+    reports = independent_sources(linkable)
+    total = len(reports)
+
+    picked, used_buckets, taken = [], set(), set()
+
+    for i, row in enumerate(reports):
+        if len(picked) >= MAX_SOURCE_LINKS:
+            break
+        bucket = LEAN_BUCKET.get(row["bias_rating"])
+        if bucket and bucket not in used_buckets:
+            used_buckets.add(bucket)
+            picked.append(row)
+            taken.add(i)
+
+    for i, row in enumerate(reports):
+        if len(picked) >= MAX_SOURCE_LINKS:
+            break
+        if i not in taken:
+            picked.append(row)
+
+    return picked, total
+
+
+def _source_links(cur, story_id):
     cur.execute(
-        "SELECT DISTINCT outlet_name, domain FROM story_sources WHERE story_id = ?",
+        """SELECT title, url, domain, outlet_name, bias_rating FROM story_sources
+           WHERE story_id = ? AND url IS NOT NULL""",
         (story_id,),
     )
-    outlets = [row["outlet_name"] or row["domain"] for row in cur.fetchall()]
-    source_line = ", ".join(outlets)
-    if len(spread) > 1:
-        source_line += " — mixed coverage"
+    picked, total = _pick_sources(cur.fetchall())
+    if not picked:
+        return ""
 
-    # Prefer the Claude-cleaned summary over the raw (often messily-scraped) GDELT headline.
-    text = story["summary"] or story["headline"]
-    return f"{index}. [{tag}] <b>{_escape(text)}</b>\n   {_escape(source_line)}"
+    links = []
+    for row in picked:
+        label = row["outlet_name"] or row["domain"]
+        href = html.escape(row["url"], quote=True)
+        links.append(f'<a href="{href}">{_escape(label)}</a>')
 
-
-def _update_line(cur, story_id, label):
-    cur.execute("SELECT headline, summary FROM stories WHERE id = ?", (story_id,))
-    row = cur.fetchone()
-    blurb = row["summary"] or "new development"
-    headline = (row["headline"] or "").strip()
-    return f'↻ {label}. Update on "{_escape(headline)}" (followed):\n   {_escape(blurb)}'
+    line = " · ".join(links)
+    if total > len(picked):
+        line += f" +{total - len(picked)} more"
+    return line
 
 
-def compose_digest(cur, dedupe_results, max_stories=6, now=None):
-    """Builds {"text": str, "reply_markup": dict|None} from one dedupe_articles() run.
+def _coverage_block(cur, story_id):
+    """Bar + counts + overall lean, or "" when no source on the story is rated.
 
-    Returns None when there's nothing new and no followed-story updates -- the
-    pipeline should skip sending entirely in that case (plan section 5.5).
-    reply_markup is a Telegram inline_keyboard: one row per shown story, each with a
-    "Follow #N" + "Ask #N" button pair for new stories (Ask-only for followed/update
-    stories, since they're already followed). Buttons render below the whole message,
-    not next to each entry, so the number is how you tell them apart.
+    Deliberately renders nothing rather than an empty bar or the word "Unrated" --
+    an unrated story just doesn't get a coverage line.
     """
-    new_ids = sorted({r["story_id"] for r in dedupe_results if r["action"] == "new"})
-    update_ids = sorted({r["story_id"] for r in dedupe_results if r["action"] == "update"})
+    coverage = story_coverage(cur, story_id)
+    if coverage is None:
+        return ""
+    return (f"{coverage['bar']} <b>{_escape(coverage['lean'])}</b>\n"
+            f"Coverage: {_escape(coverage['summary_line'])}")
 
-    if not new_ids and not update_ids:
+
+def _story_message(cur, story_id, deep_dive=False, uncorroborated=False, graduated=False):
+    cur.execute(
+        "SELECT headline, summary, expanded_summary, status FROM stories WHERE id = ?",
+        (story_id,),
+    )
+    story = cur.fetchone()
+    if story is None:
         return None
 
-    shown_new = new_ids[:max_stories]
-    overflow = len(new_ids) - len(shown_new)
+    if deep_dive and story["expanded_summary"]:
+        body = story["expanded_summary"]
+    else:
+        # Prefer the Claude-written summary over the raw (often messily-scraped) headline.
+        body = story["summary"] or story["headline"]
 
-    # Must be timezone-aware: the server runs on UTC, so a naive now() would label
-    # the 8:00pm Pacific digest "3:00am".
+    parts = []
+    if deep_dive:
+        parts.append("\U0001F50E <b>Deeper coverage</b>")
+    elif graduated:
+        # This one was shown before as a single source; other outlets have since picked
+        # it up. Saying so is why seeing it twice isn't confusing.
+        parts.append("\U0001F53A <b>Now corroborated</b>")
+    parts.append(f"<b>{_escape(body)}</b>" if not deep_dive else _escape(body))
+
+    links = _source_links(cur, story_id)
+    if links:
+        parts.append(links)
+
+    if uncorroborated:
+        # Sits where the coverage bar would go, because it's the same statement: this is
+        # what we know about how well-sourced the story is. Never dressed up as a spread.
+        parts.append("<i>Single source — not yet corroborated.</i>")
+    else:
+        coverage = _coverage_block(cur, story_id)
+        if coverage:
+            parts.append(coverage)
+
+    following = story["status"] == "followed"
+    buttons = [[
+        {"text": "Following ✓ (tap to stop)" if following else "Follow",
+         "callback_data": f"{'stop' if following else 'follow'}:{story_id}"},
+        {"text": "Ask", "callback_data": f"ask:{story_id}"},
+    ]]
+
+    return {
+        "text": "\n\n".join(parts),
+        "reply_markup": {"inline_keyboard": buttons},
+        "story_id": story_id,
+    }
+
+
+def _update_message(cur, story_id):
+    cur.execute("SELECT headline, summary FROM stories WHERE id = ?", (story_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    headline = (row["headline"] or "").strip()
+    blurb = row["summary"] or "new development"
+
+    parts = [f'↻ <b>Update</b> — {_escape(headline)}', _escape(blurb)]
+    links = _source_links(cur, story_id)
+    if links:
+        parts.append(links)
+    coverage = _coverage_block(cur, story_id)
+    if coverage:
+        parts.append(coverage)
+
+    return {
+        "text": "\n\n".join(parts),
+        "reply_markup": {"inline_keyboard": [[
+            {"text": "Following ✓ (tap to stop)", "callback_data": f"stop:{story_id}"},
+            {"text": "Ask", "callback_data": f"ask:{story_id}"},
+        ]]},
+        "story_id": story_id,
+    }
+
+
+def compose_digest(cur, story_ids, update_ids=(), deep_dive_ids=(), now=None, overflow=0,
+                   uncorroborated_ids=(), graduated_ids=()):
+    """Builds {"messages": [...], "story_ids": [...]} or None if there's nothing to send.
+
+    story_ids: ordered story ids to show as the body of the digest. The caller decides
+    eligibility and ordering (see pipeline.py -- it enforces the 2-source minimum and
+    puts requested deep-dives first); this function just renders what it's handed.
+    deep_dive_ids: subset of story_ids to render with their expanded write-up.
+
+    Each returned message is {text, reply_markup, story_id?, disable_notification}.
+    Only the header pings the phone; the rest arrive silently so one digest is one
+    notification rather than ten.
+    """
+    story_ids = list(story_ids)
+    update_ids = [sid for sid in update_ids if sid not in set(story_ids)]
+    if not story_ids and not update_ids:
+        return None
+
+    deep_dive = set(deep_dive_ids)
+    uncorroborated = set(uncorroborated_ids)
+    graduated = set(graduated_ids)
+
+    # Must be timezone-aware: the server runs on UTC, so a naive now() would label the
+    # 8:00pm Pacific digest "3:00am".
     now = now or datetime.now(ZoneInfo(DISPLAY_TIMEZONE))
-    update_word = "update" if len(update_ids) == 1 else "updates"
-    intro = (
-        "\U0001F44B Here's what's happening in your tracked topics -- tap Ask on any "
-        "story to dig deeper, or just message me to start tracking something new."
-    )
-    header = f"\U0001F4F0 News — {_format_time(now)} ({len(new_ids)} new, {len(update_ids)} {update_word})"
 
-    lines = [intro, "", header, ""]
-    buttons = []
-    for i, story_id in enumerate(shown_new, start=1):
-        lines.append(_story_line(cur, story_id, i))
-        lines.append("")
-        buttons.append([
-            {"text": f"Follow #{i}", "callback_data": f"follow:{story_id}"},
-            {"text": f"Ask #{i}", "callback_data": f"ask:{story_id}"},
-        ])
+    messages = [{"text": f"\U0001F4F0 <b>News — {_format_time(now)}</b>",
+                 "reply_markup": None}]
+
+    shown = []
+    for story_id in story_ids:
+        message = _story_message(cur, story_id, deep_dive=story_id in deep_dive,
+                                 uncorroborated=story_id in uncorroborated,
+                                 graduated=story_id in graduated)
+        if message is not None:
+            messages.append(message)
+            shown.append(story_id)
+
+    for story_id in update_ids:
+        message = _update_message(cur, story_id)
+        if message is not None:
+            messages.append(message)
+            shown.append(story_id)
+
+    if len(messages) == 1:
+        return None
 
     if overflow > 0:
-        lines.append(f"+{overflow} more, refine your topics")
-        lines.append("")
+        messages.append({"text": f"+{overflow} more this cycle — refine your topics to narrow it down.",
+                         "reply_markup": None})
 
-    if update_ids:
-        for j, story_id in enumerate(update_ids, start=1):
-            label = f"U{j}"
-            lines.append(_update_line(cur, story_id, label))
-            lines.append("")
-            buttons.append([{"text": f"Ask {label}", "callback_data": f"ask:{story_id}"}])
+    messages.append({"text": FOLLOW_UP_PROMPT, "reply_markup": None})
 
-    text = "\n".join(lines).rstrip()
-    reply_markup = {"inline_keyboard": buttons} if buttons else None
+    for i, message in enumerate(messages):
+        message["disable_notification"] = i > 0
 
-    return {"text": text, "reply_markup": reply_markup}
+    return {"messages": messages, "story_ids": shown}
 
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    from news_alert.bias import tag_untagged_sources
-    from news_alert.db import get_preferences, db_cursor
-    from news_alert.dedupe import dedupe_articles
-    from news_alert.fetcher import fetch_all
-    from news_alert.summarizer import summarize_pending_stories
-
-    prefs = get_preferences()
-    if prefs is None:
-        print("No preferences set. Run scripts/set_preferences.py first.")
-        sys.exit(1)
-
-    print("Fetching...")
-    articles = fetch_all(prefs)
-    print(f"\nFetched {len(articles)} articles. Deduping...")
-    results = dedupe_articles(articles)
+    from news_alert.db import db_cursor
 
     with db_cursor() as cur:
-        tagged = tag_untagged_sources(cur)
-        print(f"Tagged {tagged} sources with bias ratings.")
+        cur.execute(
+            """SELECT story_id FROM story_sources GROUP BY story_id
+               HAVING COUNT(DISTINCT domain) >= 2 LIMIT 6"""
+        )
+        ids = [r["story_id"] for r in cur.fetchall()]
+        digest = compose_digest(cur, ids)
 
-    print("Summarizing new stories via Claude...")
-    with db_cursor() as cur:
-        summarized = summarize_pending_stories(cur)
-    print(f"Summarized {summarized} stories.\n")
-
-    with db_cursor() as cur:
-        digest = compose_digest(cur, results, max_stories=prefs["digest_max_stories"])
-
-    print("=" * 40)
     if digest is None:
-        print("Nothing new, no followed-story updates -- would skip sending.")
+        print("Nothing to send.")
     else:
-        print(digest["text"])
-        print("\n--- reply_markup ---")
-        print(digest["reply_markup"])
-    print("=" * 40)
+        for message in digest["messages"]:
+            print("-" * 50)
+            print(message["text"])
+            if message.get("reply_markup"):
+                print(f"  [buttons] {message['reply_markup']}")
