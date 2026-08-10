@@ -39,14 +39,47 @@ def significant_words(term):
     return [w for w in words if len(w) >= MIN_WORD_LENGTH and w not in STOPWORDS]
 
 
-def _matches(word, text):
-    """Whether `word` appears in `text` as a word, allowing an inflected ending.
+# Endings a term word may pick up and still be the same word: California/Californian,
+# regulation/regulations, Hawaii/Hawaiian.
+_INFLECTION = r"(?:'s|s|es|n|ns|an|ans|ian|ians|ish)?"
 
-    Prefix rather than exact match so "California" catches "Californian" and
-    "Californians", and "regulation" catches "regulations". Bounded on the left only:
-    matching inside a word would let "iran" hit "tyrannical".
+# Shortest shared opening that counts two long words as the same subject. Five is what
+# separates the case this exists for -- cybersecurity/cyberattack -- from the nearest
+# false positive, politics/police, which share only four.
+MIN_SHARED_PREFIX = 5
+MIN_COMPOUND_LENGTH = 6
+
+_LONG_WORD_RE = re.compile(rf"[a-z]{{{MIN_SHARED_PREFIX},}}")
+
+
+def _shared_prefix(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _matches(word, text):
+    """Whether `word` is present in `text` as the same subject.
+
+    Bounded on BOTH sides plus an optional inflection. A left-only boundary looks
+    tempting and is wrong in both directions: it let "war" match "warm" and "warning",
+    and it could not match at all in the direction that mattered.
+
+    The second pass handles compounds, which the first cannot reach. "cybersecurity"
+    shares no whole word with a headline about "cyberattacks", yet that headline is
+    exactly what a cybersecurity search is for -- one such story led the 12:00 digest on
+    2026-08-10 and scored zero. Restricted to longer words, since short ones share
+    openings by coincidence (iran/iraq).
     """
-    return re.search(rf"\b{re.escape(word)}", text) is not None
+    if re.search(rf"\b{re.escape(word)}{_INFLECTION}\b", text):
+        return True
+    if len(word) < MIN_COMPOUND_LENGTH:
+        return False
+    return any(_shared_prefix(word, other.group()) >= MIN_SHARED_PREFIX
+               for other in _LONG_WORD_RE.finditer(text))
 
 
 def topic_score(term, titles):
