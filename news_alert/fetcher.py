@@ -54,6 +54,20 @@ GLOBAL_REGION = "GLOBAL"
 # false merges); sampling deeper does.
 MAX_RECORDS = 250
 
+# GDELT indexes the whole world's press, so an unfiltered query returns whatever
+# language the outlet published in. Two stories in the 2026-08-10 digests came back
+# unreadable because of it: one was delivered to the phone as a raw Hebrew headline
+# (the summarizer produced nothing, so digest.py fell back to the headline), and
+# another as the summarizer narrating its own confusion -- "These appear to be
+# translations of the same headline into different languages (German, Turkish...".
+#
+# Filtering at retrieval is the right layer: the summarizer can't write a good English
+# summary from Turkish headlines, and the event grouper wastes Haiku calls clustering
+# copy nobody will read. Verified against the live API -- `sourcelang:eng` is accepted
+# and returned 250/250 English articles, i.e. no loss of volume, since the cap is what
+# binds. (Codes are three-letter: `eng`, not `english`.)
+SOURCE_LANGUAGE = "eng"
+
 # FIPS 10-4 country codes for GDELT's sourcecountry: operator.
 COUNTRY_FIPS = {
     "US": "US", "UNITED STATES": "US",
@@ -97,6 +111,11 @@ def _build_query(term, region=None, keywords=None, excluded_sources=None):
         terms.extend(keywords)
 
     query = " ".join(terms)
+
+    # Applies to topic and place searches alike -- an unreadable story is unreadable
+    # whichever search found it. See SOURCE_LANGUAGE.
+    if SOURCE_LANGUAGE:
+        query += f" sourcelang:{SOURCE_LANGUAGE}"
 
     # A place that's a recognized country can additionally be pinned to that country's
     # outlets. Anything smaller (a state, a city) has no FIPS code and stays a plain

@@ -97,9 +97,20 @@ _REFUSAL_MARKERS = (
     # Meta-commentary about the input rather than a summary of the news. These show up
     # when the grouper hands the summarizer a headline that doesn't belong with the
     # others -- the model helpfully narrates the mismatch instead of summarizing.
-    "i can only", "i'll summarize", "i will summarize", "headlines about the same story",
+    "i can only", "i'll summarize", "i will summarize",
     "completely different story", "unrelated story", "appears to be unrelated",
-    "the first two headlines", "the third headline", "the fourth headline",
+    "these appear to be", "appear to be translations", "translations of the same",
+    # Any mention of "headline" at all. A summary of the news describes what happened;
+    # only a summary *about its own input* talks about headlines. One went out on
+    # 2026-08-10 reading "These appear to be translations of the same headline into
+    # different languages (German, Turkish...". This subsumes the several specific
+    # phrasings previously listed here.
+    #
+    # It will occasionally misfire on a genuine story about a headline, and that's the
+    # cheap direction to be wrong in: a false positive leaves summary NULL and the digest
+    # falls back to the raw headline, while a false negative puts the model's confusion
+    # on the phone as though it were news.
+    "headline",
 )
 
 
