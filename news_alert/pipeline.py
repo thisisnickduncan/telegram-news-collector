@@ -13,13 +13,13 @@ if __package__ in (None, ""):
 from news_alert.bias import tag_untagged_sources
 from news_alert.db import get_preferences, db_cursor
 from news_alert.dedupe import dedupe_articles
-from news_alert.deep_dive import consume, pending_story_ids, record_digest
+from news_alert.deep_dive import record_digest
 from news_alert.digest import compose_digest
 from news_alert.fetcher import fetch_all
 from news_alert.mutes import muted_story_ids
 from news_alert.relevance import topic_score
 from news_alert.sources import count_independent
-from news_alert.summarizer import expand_story, summarize_pending_stories
+from news_alert.summarizer import summarize_pending_stories
 from news_alert.telegram_client import safe_call, send_message
 
 # A story must be carried by at least this many DISTINCT outlets before it's worth
@@ -233,8 +233,6 @@ def run(send_at=None):
     print(f"[pipeline] Tagged {tagged} sources with bias ratings.")
 
     with db_cursor() as cur:
-        # Stories you asked for more on lead the digest, ahead of anything new.
-        deep_dive_ids = pending_story_ids(cur)
         plan = _rank_candidates(cur, prefs["digest_max_stories"], MIN_SOURCES)
         selected, overflow, held = plan["selected"], plan["overflow"], plan["held"]
 
@@ -242,24 +240,14 @@ def run(send_at=None):
         # regardless of the source minimum -- you asked to be told about those.
         update_ids = sorted({r["story_id"] for r in results if r["action"] == "update"})
 
-    ordered = deep_dive_ids + [sid for sid in selected if sid not in set(deep_dive_ids)]
+    # Deep dives used to be queued and led the following digest. They're answered on the
+    # spot now (message_handler), so a run has nothing pending to fold in.
+    ordered = list(selected)
     corroborated = len(selected) - len(plan["uncorroborated"])
     print(f"[pipeline] {corroborated} corroborated ({MIN_SOURCES}+ independent sources), "
           f"{len(plan['uncorroborated'])} single-source fill, {overflow} overflow, "
           f"{held} held awaiting corroboration, {len(plan['graduated'])} newly corroborated, "
-          f"{len(deep_dive_ids)} deep-dive requested, {len(update_ids)} followed updates.")
-
-    if deep_dive_ids:
-        print(f"[pipeline] Expanding {len(deep_dive_ids)} requested stories...")
-        with db_cursor() as cur:
-            for story_id in deep_dive_ids:
-                try:
-                    expand_story(cur, story_id)
-                except Exception:
-                    # A failed expansion shouldn't sink the digest -- the story still
-                    # renders with its normal summary.
-                    print(f"[pipeline] expand failed for story {story_id}:")
-                    traceback.print_exc()
+          f"{len(update_ids)} followed updates.")
 
     print(f"[pipeline] Summarizing {len(ordered)} shown + {len(update_ids)} followed...")
     with db_cursor() as cur:
@@ -270,7 +258,7 @@ def run(send_at=None):
     # the time it happened to finish composing.
     with db_cursor() as cur:
         digest = compose_digest(cur, ordered, update_ids=update_ids,
-                                deep_dive_ids=deep_dive_ids, now=send_at,
+                                now=send_at,
                                 uncorroborated_ids=plan["uncorroborated"],
                                 graduated_ids=plan["graduated"])
 
@@ -320,10 +308,9 @@ def run(send_at=None):
                    WHERE id = ?""",
                 (message_id, now, 1 if story_id in uncorroborated else MIN_SOURCES, story_id),
             )
+        # What this digest contained is what a later reply resolves "the Iran one"
+        # against, so it has to be recorded even though nothing is queued any more.
         record_digest(cur, [story_id for story_id, _ in sent_ids])
-        # Consumed only after a successful send, so a run that dies mid-flight leaves
-        # the request queued for the next one.
-        consume(cur, deep_dive_ids)
 
 
 if __name__ == "__main__":

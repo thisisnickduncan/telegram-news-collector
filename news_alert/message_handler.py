@@ -12,12 +12,15 @@ apart, so intent is classified rather than assumed:
   call decides which, with the last digest's stories in front of it -- "the Iran one"
   only resolves if you can see what was in the digest.
 
-Digest replies are queued (see deep_dive.py) rather than acted on immediately, so an
-answer that arrives three hours later still steers the next run.
+A reply is resolved against the *last digest sent*, which stays the active target until
+the next one goes out -- so an answer arriving three hours later still lands on the right
+stories. The expansion itself is then done on the spot rather than queued: deferring it
+cost exactly the same, since it is one Sonnet + web_search call either way.
 """
 import json
 import re
 import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,9 +30,16 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from news_alert.config import ANTHROPIC_API_KEY
-from news_alert.deep_dive import last_digest_stories, queue_stories
+from news_alert.deep_dive import last_digest_stories
+from news_alert.digest import deep_dive_message
 from news_alert.mutes import active_rules, deactivate_rule
+from news_alert.summarizer import expand_story
 from news_alert.telegram_client import safe_call, send_message
+
+# Ceiling on how many stories one reply expands. Each is a Sonnet call with live web
+# search -- the most expensive thing the system does -- and "all of them" on a ten-story
+# digest should not quietly spend ten of them.
+MAX_IMMEDIATE_EXPANSIONS = 3
 
 # Only phrasings that can mean nothing else. "show me 3" deliberately does NOT match:
 # the digest ends by asking which stories you want more on, so a bare number after a
@@ -147,28 +157,51 @@ def _classify_reply(text, stories, client):
 
 
 def _handle_deep_dive_request(cur, chat_id, story_ids, stories, client):
-    queued = queue_stories(cur, story_ids)
+    """Answers now rather than queueing for the next digest.
+
+    Deferring cost exactly the same -- it's one Sonnet + web_search call either way --
+    so the wait bought nothing. Asking at 8:05 and reading the answer at noon, buried
+    among nine stories you didn't ask about, was strictly worse than answering while
+    you're still looking at the story that prompted the question.
+    """
     by_id = {s["id"]: s for s in stories}
+    requested = list(dict.fromkeys(story_ids))
+    story_ids = requested[:MAX_IMMEDIATE_EXPANSIONS]
 
-    if not queued:
-        safe_call(send_message, chat_id,
-                  "Already queued those -- they'll lead your next digest.", parse_mode=None)
-        return
+    # Web search takes a while and the poller is single-threaded, so say something first
+    # -- otherwise "all of them" looks like the bot ignored you for a minute.
+    ack = ("Looking into that one — give me a moment."
+           if len(story_ids) == 1
+           else f"Looking into {len(story_ids)} of them — give me a moment.")
+    if len(requested) > len(story_ids):
+        # Each expansion is a Sonnet call with live web search, so "all of them" on a
+        # ten-story digest is capped rather than quietly spending ten of them.
+        ack += (f" You picked {len(requested)}; I'll do the first "
+                f"{MAX_IMMEDIATE_EXPANSIONS} — ask again for the rest.")
+    safe_call(send_message, chat_id, ack, parse_mode=None)
 
-    labels = []
-    for story_id in queued:
-        story = by_id.get(story_id)
-        text = ((story or {}).get("summary") or (story or {}).get("headline") or "").strip()
-        labels.append(text[:70] + ("…" if len(text) > 70 else ""))
+    for story_id in story_ids:
+        story = by_id.get(story_id) or {}
+        label = (story.get("summary") or story.get("headline") or "that story").strip()[:60]
+        try:
+            expanded = expand_story(cur, story_id, client=client)
+        except Exception:
+            print(f"[message_handler] expand failed for story {story_id}:")
+            traceback.print_exc()
+            expanded = None
 
-    listing = "\n".join(f"• {label}" for label in labels)
-    plural = "these" if len(queued) > 1 else "this"
-    safe_call(
-        send_message, chat_id,
-        f"Got it -- I'll pull deeper coverage on {plural} and lead your next digest with "
-        f"{'them' if len(queued) > 1 else 'it'}:\n{listing}",
-        parse_mode=None,
-    )
+        if not expanded:
+            safe_call(send_message, chat_id,
+                      f"I couldn't pull anything more on \"{label}\" — the original "
+                      f"sources are all I have.", parse_mode=None)
+            continue
+
+        message = deep_dive_message(cur, story_id)
+        if message is None:
+            safe_call(send_message, chat_id, expanded, parse_mode=None)
+        else:
+            safe_call(send_message, chat_id, message["text"],
+                      reply_markup=message["reply_markup"])
 
 
 def _list_mutes(cur, chat_id):

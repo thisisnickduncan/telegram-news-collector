@@ -45,10 +45,10 @@ def _safe_url(url):
     return cleaned if cleaned.lower().startswith(SAFE_URL_SCHEMES) else None
 
 FOLLOW_UP_PROMPT = (
-    "\U0001F5E3 Which of these do you want deeper coverage on next time?\n"
-    "Just reply naming them however you like -- \"the Iran one and the cyber story\" is "
-    "fine. No rush: whenever you get to it, I'll pick it up and lead the next digest "
-    "with them."
+    "\U0001F5E3 Want more on any of these?\n"
+    "Reply naming them however you like -- \"the Iran one and the cyber story\" is fine, "
+    "and I'll dig in and send it straight back. No rush either: this digest stays the "
+    "one I'm matching against until the next one goes out."
 )
 
 
@@ -174,29 +174,24 @@ def _coverage_block(cur, story_id):
             f"Coverage: {_escape(coverage['summary_line'])}")
 
 
-def _story_message(cur, story_id, deep_dive=False, uncorroborated=False, graduated=False):
+def _story_message(cur, story_id, uncorroborated=False, graduated=False):
     cur.execute(
-        "SELECT headline, summary, expanded_summary, status FROM stories WHERE id = ?",
+        "SELECT headline, summary, status FROM stories WHERE id = ?",
         (story_id,),
     )
     story = cur.fetchone()
     if story is None:
         return None
 
-    if deep_dive and story["expanded_summary"]:
-        body = story["expanded_summary"]
-    else:
-        # Prefer the Claude-written summary over the raw (often messily-scraped) headline.
-        body = story["summary"] or story["headline"]
+    # Prefer the Claude-written summary over the raw (often messily-scraped) headline.
+    body = story["summary"] or story["headline"]
 
     parts = []
-    if deep_dive:
-        parts.append("\U0001F50E <b>Deeper coverage</b>")
-    elif graduated:
+    if graduated:
         # This one was shown before as a single source; other outlets have since picked
         # it up. Saying so is why seeing it twice isn't confusing.
         parts.append("\U0001F53A <b>Now corroborated</b>")
-    parts.append(f"<b>{_escape(body)}</b>" if not deep_dive else _escape(body))
+    parts.append(f"<b>{_escape(body)}</b>")
 
     links = _source_links(cur, story_id)
     if links:
@@ -210,6 +205,35 @@ def _story_message(cur, story_id, deep_dive=False, uncorroborated=False, graduat
         coverage = _coverage_block(cur, story_id)
         if coverage:
             parts.append(coverage)
+
+    return {
+        "text": "\n\n".join(parts),
+        "reply_markup": story_keyboard(story_id, following=story["status"] == "followed"),
+        "story_id": story_id,
+    }
+
+
+def deep_dive_message(cur, story_id):
+    """The expanded briefing for a story you asked to go deeper on.
+
+    Sent on its own, the moment you ask, rather than folded into the next digest. The
+    answer used to wait for the following cycle, which meant asking a question at 8:05
+    and reading the answer at noon, next to nine stories you hadn't asked about.
+    """
+    cur.execute(
+        "SELECT expanded_summary, status FROM stories WHERE id = ?", (story_id,)
+    )
+    story = cur.fetchone()
+    if story is None or not story["expanded_summary"]:
+        return None
+
+    parts = ["\U0001F50E <b>Deeper coverage</b>", _escape(story["expanded_summary"])]
+    links = _source_links(cur, story_id)
+    if links:
+        parts.append(links)
+    coverage = _coverage_block(cur, story_id)
+    if coverage:
+        parts.append(coverage)
 
     return {
         "text": "\n\n".join(parts),
@@ -243,14 +267,15 @@ def _update_message(cur, story_id):
     }
 
 
-def compose_digest(cur, story_ids, update_ids=(), deep_dive_ids=(), now=None,
+def compose_digest(cur, story_ids, update_ids=(), now=None,
                    uncorroborated_ids=(), graduated_ids=()):
     """Builds {"messages": [...], "story_ids": [...]} or None if there's nothing to send.
 
     story_ids: ordered story ids to show as the body of the digest. The caller decides
     eligibility and ordering (see pipeline.py -- it enforces the 2-source minimum and
-    puts requested deep-dives first); this function just renders what it's handed.
-    deep_dive_ids: subset of story_ids to render with their expanded write-up.
+    ranks by topicality); this function just renders what it's handed. Requested
+    deep-dives are not part of a digest at all any more -- they're sent when asked for,
+    by deep_dive_message().
 
     Each returned message is {text, reply_markup, story_id?, disable_notification}.
     Only the header pings the phone; the rest arrive silently so one digest is one
@@ -261,7 +286,6 @@ def compose_digest(cur, story_ids, update_ids=(), deep_dive_ids=(), now=None,
     if not story_ids and not update_ids:
         return None
 
-    deep_dive = set(deep_dive_ids)
     uncorroborated = set(uncorroborated_ids)
     graduated = set(graduated_ids)
 
@@ -274,7 +298,7 @@ def compose_digest(cur, story_ids, update_ids=(), deep_dive_ids=(), now=None,
 
     shown = []
     for story_id in story_ids:
-        message = _story_message(cur, story_id, deep_dive=story_id in deep_dive,
+        message = _story_message(cur, story_id,
                                  uncorroborated=story_id in uncorroborated,
                                  graduated=story_id in graduated)
         if message is not None:
