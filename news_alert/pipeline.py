@@ -16,6 +16,7 @@ from news_alert.dedupe import dedupe_articles
 from news_alert.deep_dive import consume, pending_story_ids, record_digest
 from news_alert.digest import compose_digest
 from news_alert.fetcher import fetch_all
+from news_alert.mutes import muted_story_ids
 from news_alert.relevance import topic_score
 from news_alert.sources import count_independent
 from news_alert.summarizer import expand_story, summarize_pending_stories
@@ -43,6 +44,11 @@ STORY_MAX_AGE_HOURS = 24
 # Telegram will throttle a burst of messages to one chat. A digest is now one message
 # per story, so they're paced out slightly. The header still lands exactly on the hour.
 SEND_SPACING_SECONDS = 0.4
+
+# How deep into the candidate list mute rules are applied, as a multiple of the digest
+# size. Screening everything would mean screening the whole held pool -- four figures of
+# single-source stories that were never going to be shown.
+MUTE_SCREEN_MULTIPLIER = 3
 
 
 def _notify(prefs, text):
@@ -72,7 +78,19 @@ def _hold_until(send_at):
               f"-- sending immediately.")
 
 
-def _rank_candidates(cur, max_stories, min_sources):
+def _muted_ids(cur, story_ids, client=None):
+    """Candidates belonging to a category the user muted. Empty (and free) with no rules."""
+    story_ids = list(dict.fromkeys(story_ids))      # de-dup, preserve order
+    if not story_ids:
+        return set()
+    placeholders = ",".join("?" * len(story_ids))
+    cur.execute(f"SELECT id, headline, summary FROM stories WHERE id IN ({placeholders})",
+                tuple(story_ids))
+    text = {row["id"]: (row["summary"] or row["headline"] or "") for row in cur.fetchall()}
+    return muted_story_ids(cur, [(sid, text.get(sid, "")) for sid in story_ids], client=client)
+
+
+def _rank_candidates(cur, max_stories, min_sources, client=None):
     """Works out what this digest should carry.
 
     Returns {selected, overflow, held, uncorroborated, graduated} where `selected` is
@@ -105,7 +123,7 @@ def _rank_candidates(cur, max_stories, min_sources):
         """SELECT s.id AS id, s.delivered_at AS delivered_at, s.topic AS topic,
                   COUNT(DISTINCT ss.domain) AS domains, MAX(ss.fetched_at) AS latest
            FROM stories s JOIN story_sources ss ON ss.story_id = s.id
-           WHERE s.status != 'expired'
+           WHERE s.status NOT IN ('expired', 'muted')
              AND (s.delivered_at IS NULL OR COALESCE(s.delivered_source_count, 99) < ?)
            GROUP BY s.id
            HAVING MAX(ss.fetched_at) >= ?
@@ -142,7 +160,19 @@ def _rank_candidates(cur, max_stories, min_sources):
     strong.sort(reverse=True)
     weak.sort(reverse=True)
     corroborated = [story_id for _, _, _, story_id in strong]
-    held = len(weak)
+    weak_ids = [story_id for _, story_id in weak]
+
+    # Category muting. Only candidates that could plausibly reach the digest are
+    # screened: the held pool runs to four figures, and screening all of it would spend
+    # ~18 calls a run filtering stories nobody was going to be shown anyway. Screening to
+    # a multiple of the digest size leaves headroom for a rule that matches much of the
+    # top of the list. Costs nothing at all when no rules exist.
+    depth = max_stories * MUTE_SCREEN_MULTIPLIER
+    muted = _muted_ids(cur, corroborated[:depth] + weak_ids[:depth], client)
+    if muted:
+        corroborated = [sid for sid in corroborated if sid not in muted]
+        weak_ids = [sid for sid in weak_ids if sid not in muted]
+        print(f"[pipeline] {len(muted)} candidate(s) dropped by mute rules.")
 
     selected = corroborated[:max_stories]
     overflow = max(len(corroborated) - max_stories, 0)
@@ -154,13 +184,13 @@ def _rank_candidates(cur, max_stories, min_sources):
     uncorroborated = []
     if len(selected) < DIGEST_MIN_STORIES:
         room = min(DIGEST_MIN_STORIES, max_stories) - len(selected)
-        uncorroborated = [story_id for _, story_id in weak[:room]]
+        uncorroborated = weak_ids[:room]
         selected = selected + uncorroborated
 
     return {
         "selected": selected,
         "overflow": overflow,
-        "held": held - len(uncorroborated),
+        "held": len(weak_ids) - len(uncorroborated),
         "uncorroborated": uncorroborated,
         "graduated": graduated,
     }

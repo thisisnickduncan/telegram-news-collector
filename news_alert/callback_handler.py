@@ -1,5 +1,13 @@
-"""Parses Telegram inline-button presses: follow:<id>, stop:<id>, ask:<id>.
-Plan section 5.7 (extended with "ask" for the per-story Q&A feature).
+"""Parses Telegram inline-button presses.
+
+follow / stop / ask, plus the ignore flow: `ignore` swaps the keyboard for a choice
+between muting this one story and muting its whole category, and `mute1` / `mutetype` /
+`keep` resolve that choice.
+
+Keyboards are rebuilt wholesale from digest.story_keyboard rather than patched button by
+button. editMessageReplyMarkup replaces the entire markup anyway, so patching only ever
+risked the two modules disagreeing about what the normal keyboard looks like and quietly
+losing a button that never came back.
 """
 import re
 import sys
@@ -9,6 +17,8 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from news_alert.digest import ignore_choice_keyboard, story_keyboard
+from news_alert.mutes import add_rule, deactivate_rule_for_story, describe_rule
 from news_alert.telegram_client import (
     answer_callback_query,
     edit_message_reply_markup,
@@ -16,29 +26,21 @@ from news_alert.telegram_client import (
     send_message,
 )
 
-CALLBACK_RE = re.compile(r"^(follow|stop|ask):(\d+)$")
+CALLBACK_RE = re.compile(r"^(follow|stop|ask|ignore|mute1|mutetype|keep|unmute):(\d+)$")
 
 
-def _flip_keyboard_button(callback_query, story_id, following):
-    """Rewrites just the one button whose callback_data matches this story's
-    follow/stop action, in place, then pushes the whole keyboard back --
-    editMessageReplyMarkup replaces the full markup, there's no partial-patch API."""
+def _set_keyboard(callback_query, markup):
     message = callback_query["message"]
-    keyboard = message.get("reply_markup", {}).get("inline_keyboard", [])
-    for row in keyboard:
-        for button in row:
-            cb = button.get("callback_data", "")
-            if cb in (f"follow:{story_id}", f"stop:{story_id}"):
-                if following:
-                    button["text"] = "Following ✓ (tap to stop)"
-                    button["callback_data"] = f"stop:{story_id}"
-                else:
-                    button["text"] = "Follow (tap to resume)"
-                    button["callback_data"] = f"follow:{story_id}"
+    safe_call(edit_message_reply_markup, message["chat"]["id"], message["message_id"], markup)
 
-    chat_id = message["chat"]["id"]
-    message_id = message["message_id"]
-    safe_call(edit_message_reply_markup, chat_id, message_id, {"inline_keyboard": keyboard})
+
+def _restore_keyboard(cur, callback_query, story_id):
+    """Puts the normal keyboard back, reflecting whatever state the story is now in."""
+    cur.execute("SELECT status FROM stories WHERE id = ?", (story_id,))
+    row = cur.fetchone()
+    status = row["status"] if row else "active"
+    _set_keyboard(callback_query, story_keyboard(story_id, following=status == "followed",
+                                                 muted=status == "muted"))
 
 
 def handle_callback_query(cur, callback_query):
@@ -53,6 +55,7 @@ def handle_callback_query(cur, callback_query):
     action, story_id = match.group(1), int(match.group(2))
     print(f"[callback_handler] action={action!r} story_id={story_id}")
     now = datetime.now(timezone.utc).isoformat()
+    chat_id = callback_query["message"]["chat"]["id"]
 
     if action == "follow":
         cur.execute(
@@ -63,13 +66,13 @@ def handle_callback_query(cur, callback_query):
         cur.execute("UPDATE stories SET status = 'followed' WHERE id = ?", (story_id,))
         safe_call(answer_callback_query, callback_query["id"],
                   text="Following. You'll get updates on this story.")
-        _flip_keyboard_button(callback_query, story_id, following=True)
+        _set_keyboard(callback_query, story_keyboard(story_id, following=True))
 
     elif action == "stop":
         cur.execute("DELETE FROM follows WHERE story_id = ?", (story_id,))
         cur.execute("UPDATE stories SET status = 'active' WHERE id = ?", (story_id,))
         safe_call(answer_callback_query, callback_query["id"], text="Stopped.")
-        _flip_keyboard_button(callback_query, story_id, following=False)
+        _set_keyboard(callback_query, story_keyboard(story_id, following=False))
 
     elif action == "ask":
         cur.execute("SELECT headline FROM stories WHERE id = ?", (story_id,))
@@ -80,7 +83,67 @@ def handle_callback_query(cur, callback_query):
             return
         cur.execute("UPDATE preferences SET pending_ask_story_id = ? WHERE id = 1", (story_id,))
         safe_call(answer_callback_query, callback_query["id"])
-        chat_id = callback_query["message"]["chat"]["id"]
         headline = (story["headline"] or "").strip()
         safe_call(send_message, chat_id, f'What would you like to know about "{headline}"?',
                   parse_mode=None)
+
+    elif action == "ignore":
+        # Nothing is muted yet -- this only opens the choice.
+        safe_call(answer_callback_query, callback_query["id"])
+        _set_keyboard(callback_query, ignore_choice_keyboard(story_id))
+
+    elif action == "keep":
+        safe_call(answer_callback_query, callback_query["id"])
+        _restore_keyboard(cur, callback_query, story_id)
+
+    elif action == "mute1":
+        cur.execute("UPDATE stories SET status = 'muted' WHERE id = ?", (story_id,))
+        cur.execute("DELETE FROM follows WHERE story_id = ?", (story_id,))
+        safe_call(answer_callback_query, callback_query["id"], text="Ignored.")
+        _set_keyboard(callback_query, story_keyboard(story_id, muted=True))
+
+    elif action == "mutetype":
+        cur.execute("SELECT headline, summary FROM stories WHERE id = ?", (story_id,))
+        story = cur.fetchone()
+        if story is None:
+            safe_call(answer_callback_query, callback_query["id"],
+                      text="That story isn't available anymore.")
+            return
+
+        rule = describe_rule(story["headline"], story["summary"])
+        if rule is None:
+            # Fall back to muting just this story rather than doing nothing: the tap was
+            # unambiguous even if naming the category wasn't.
+            cur.execute("UPDATE stories SET status = 'muted' WHERE id = ?", (story_id,))
+            safe_call(answer_callback_query, callback_query["id"],
+                      text="Ignored this story (couldn't work out the category).")
+            _set_keyboard(callback_query, story_keyboard(story_id, muted=True))
+            return
+
+        rule_id, created = add_rule(cur, rule, story_id,
+                                    (story["summary"] or story["headline"] or "").strip()[:200])
+        cur.execute("UPDATE stories SET status = 'muted' WHERE id = ?", (story_id,))
+        cur.execute("DELETE FROM follows WHERE story_id = ?", (story_id,))
+
+        safe_call(answer_callback_query, callback_query["id"], text="Ignored.")
+        _set_keyboard(callback_query, story_keyboard(story_id, muted=True))
+
+        # Say the rule out loud. A filter you can't see is one you can't correct, and
+        # this one deletes things before you ever learn they existed.
+        if created:
+            body = (f'Got it — I\'ll stop showing stories about {rule}.\n\n'
+                    f'Say "what am I ignoring" to review, or "unmute {rule_id}" to undo.')
+        else:
+            body = f'Already ignoring stories about {rule}.'
+        safe_call(send_message, chat_id, body, parse_mode=None)
+
+    elif action == "unmute":
+        cur.execute("UPDATE stories SET status = 'active' WHERE id = ?", (story_id,))
+        # If this story was what created a category rule, undo lifts that too.
+        lifted = deactivate_rule_for_story(cur, story_id)
+        safe_call(answer_callback_query, callback_query["id"], text="Un-ignored.")
+        _set_keyboard(callback_query, story_keyboard(story_id, following=False))
+        if lifted:
+            safe_call(send_message, chat_id,
+                      f'Un-ignored — I\'ll show stories about {lifted} again.',
+                      parse_mode=None)

@@ -80,8 +80,11 @@ remote "cp /tmp/news-alert-deploy/news_alert/*.py '$APP/news_alert/' \
         && echo relabeled"
 
 if [ "$RUN_MIGRATE" = 1 ]; then
+    # Every migration, in filename order, not just the newest. They are individually
+    # idempotent, so re-running the earlier ones is free and it removes the failure mode
+    # where a deploy applies v3 to a database that never got v2.
     echo "== 5. migrate schema =="
-    remote "cd '$APP' && PYTHONUNBUFFERED=1 '$APP/venv/bin/python' scripts/migrate_v2.py"
+    remote "cd '$APP' && for m in scripts/migrate_*.py; do echo \"-- \$m\"; PYTHONUNBUFFERED=1 '$APP/venv/bin/python' \"\$m\" || exit 1; done"
 fi
 
 if [ "$RUN_SEED_BIAS" = 1 ]; then

@@ -52,6 +52,48 @@ FOLLOW_UP_PROMPT = (
 )
 
 
+def story_keyboard(story_id, following=False, muted=False):
+    """The standard buttons under a story.
+
+    Shared with callback_handler rather than duplicated there: editMessageReplyMarkup
+    replaces the entire markup, so a button press has to rebuild the whole keyboard, and
+    if the two sides disagree about what "normal" looks like a press silently drops a
+    button that never comes back.
+
+    Three buttons fit one row only while the first is short. Once followed it reads
+    "Following ✓ (tap to stop)", which pushes the row past a phone's width, so it gets a
+    row of its own.
+    """
+    if muted:
+        return {"inline_keyboard": [[
+            {"text": "Ignored ✓ (tap to undo)", "callback_data": f"unmute:{story_id}"},
+        ]]}
+
+    ask = {"text": "Ask", "callback_data": f"ask:{story_id}"}
+    ignore = {"text": "Ignore", "callback_data": f"ignore:{story_id}"}
+
+    if following:
+        return {"inline_keyboard": [
+            [{"text": "Following ✓ (tap to stop)", "callback_data": f"stop:{story_id}"}],
+            [ask, ignore],
+        ]}
+    return {"inline_keyboard": [[
+        {"text": "Follow", "callback_data": f"follow:{story_id}"},
+        ask,
+        ignore,
+    ]]}
+
+
+def ignore_choice_keyboard(story_id):
+    """What "Ignore" expands into. Muting a category is worth one deliberate extra tap:
+    its effect is invisible until a later digest quietly drops something."""
+    return {"inline_keyboard": [
+        [{"text": "Just this one", "callback_data": f"mute1:{story_id}"},
+         {"text": "Stories like this", "callback_data": f"mutetype:{story_id}"}],
+        [{"text": "Cancel", "callback_data": f"keep:{story_id}"}],
+    ]}
+
+
 def _format_time(now):
     hour = now.hour % 12 or 12
     ampm = "am" if now.hour < 12 else "pm"
@@ -169,16 +211,9 @@ def _story_message(cur, story_id, deep_dive=False, uncorroborated=False, graduat
         if coverage:
             parts.append(coverage)
 
-    following = story["status"] == "followed"
-    buttons = [[
-        {"text": "Following ✓ (tap to stop)" if following else "Follow",
-         "callback_data": f"{'stop' if following else 'follow'}:{story_id}"},
-        {"text": "Ask", "callback_data": f"ask:{story_id}"},
-    ]]
-
     return {
         "text": "\n\n".join(parts),
-        "reply_markup": {"inline_keyboard": buttons},
+        "reply_markup": story_keyboard(story_id, following=story["status"] == "followed"),
         "story_id": story_id,
     }
 
@@ -199,12 +234,11 @@ def _update_message(cur, story_id):
     if coverage:
         parts.append(coverage)
 
+    # An update only exists for a story you follow, so the keyboard is always the
+    # followed variant.
     return {
         "text": "\n\n".join(parts),
-        "reply_markup": {"inline_keyboard": [[
-            {"text": "Following ✓ (tap to stop)", "callback_data": f"stop:{story_id}"},
-            {"text": "Ask", "callback_data": f"ask:{story_id}"},
-        ]]},
+        "reply_markup": story_keyboard(story_id, following=True),
         "story_id": story_id,
     }
 

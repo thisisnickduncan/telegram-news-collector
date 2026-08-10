@@ -16,6 +16,7 @@ Digest replies are queued (see deep_dive.py) rather than acted on immediately, s
 answer that arrives three hours later still steers the next run.
 """
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +28,16 @@ if __package__ in (None, ""):
 
 from news_alert.config import ANTHROPIC_API_KEY
 from news_alert.deep_dive import last_digest_stories, queue_stories
+from news_alert.mutes import active_rules, deactivate_rule
 from news_alert.telegram_client import safe_call, send_message
+
+# Only phrasings that can mean nothing else. "show me 3" deliberately does NOT match:
+# the digest ends by asking which stories you want more on, so a bare number after a
+# neutral verb is far more likely to mean story 3 than mute rule 3, and being wrong
+# there silently turns a filter off.
+_UNMUTE_RE = re.compile(
+    r"^\s*(?:un-?mute|un-?ignore|stop ignoring)\s+#?(\d+)\s*$", re.IGNORECASE
+)
 
 TOPIC_MODEL = "claude-haiku-4-5"
 INTENT_MODEL = "claude-haiku-4-5"
@@ -56,7 +66,10 @@ INTENT_SYSTEM = (
     "wording -- \"the Iran one\", \"that cyber story\", \"the second one\" all count.\n"
     "TOPIC <phrase>       -- the message asks to follow a NEW subject that isn't one of "
     "the listed stories. Give a short search-ready phrase, e.g. \"TOPIC Fed rate decisions\".\n"
-    "NONE                 -- small talk, unclear, or unrelated to either.\n\n"
+    "MUTES                -- the message asks what is currently being ignored, muted, "
+    "filtered or hidden, e.g. \"what am I ignoring?\", \"show my mutes\", \"what's "
+    "filtered out\".\n"
+    "NONE                 -- small talk, unclear, or unrelated to any of these.\n\n"
     "Prefer DEEPDIVE when the message plainly refers to stories in the list. Prefer TOPIC "
     "when it names a subject that isn't there. Output nothing but that single line."
 )
@@ -112,6 +125,9 @@ def _classify_reply(text, stories, client):
     print(f"[message_handler] intent classification on {text!r} -> {reply!r}")
 
     upper = reply.upper()
+    if upper.startswith("MUTES"):
+        return "mutes", None
+
     if upper.startswith("DEEPDIVE"):
         picked = []
         for token in reply[len("DEEPDIVE"):].replace(",", " ").split():
@@ -153,6 +169,36 @@ def _handle_deep_dive_request(cur, chat_id, story_ids, stories, client):
         f"{'them' if len(queued) > 1 else 'it'}:\n{listing}",
         parse_mode=None,
     )
+
+
+def _list_mutes(cur, chat_id):
+    """Shows what's being filtered out. A filter you can't see is one you can't correct,
+    and this one removes stories before you ever learn they existed."""
+    rules = active_rules(cur)
+    if not rules:
+        safe_call(send_message, chat_id,
+                  "You're not ignoring anything right now. Tap Ignore under any story to "
+                  "mute it, or mute stories like it.", parse_mode=None)
+        return
+
+    lines = "\n".join(f"{row['id']}. {row['rule']}" for row in rules)
+    safe_call(
+        send_message, chat_id,
+        f"You're ignoring:\n{lines}\n\nReply \"unmute {rules[0]['id']}\" (with the number) "
+        f"to start seeing one of these again.",
+        parse_mode=None,
+    )
+
+
+def _handle_unmute(cur, chat_id, rule_id):
+    rule = deactivate_rule(cur, rule_id)
+    if rule is None:
+        safe_call(send_message, chat_id,
+                  f"There's no active rule {rule_id}. Say \"what am I ignoring\" to see the list.",
+                  parse_mode=None)
+        return
+    safe_call(send_message, chat_id,
+              f"Done — I'll show stories about {rule} again.", parse_mode=None)
 
 
 def _handle_topic_request(cur, chat_id, text, client, topic=None):
@@ -257,6 +303,13 @@ def handle_message(cur, message, client=None):
         _answer_story_question(cur, chat_id, row["pending_ask_story_id"], text, client)
         return
 
+    # "unmute 3" is unambiguous, so it's matched here rather than spending a
+    # classification call on it -- and a classifier can't be trusted with the number.
+    unmute = _UNMUTE_RE.match(text)
+    if unmute:
+        _handle_unmute(cur, chat_id, int(unmute.group(1)))
+        return
+
     # Otherwise this is either an answer to the digest's closing prompt or a new topic.
     # The last digest stays the active target until the next one goes out, which is what
     # makes a reply three hours later still land on the right stories.
@@ -266,6 +319,8 @@ def handle_message(cur, message, client=None):
 
     if intent == "deep_dive":
         _handle_deep_dive_request(cur, chat_id, payload, stories, client)
+    elif intent == "mutes":
+        _list_mutes(cur, chat_id)
     elif intent == "topic":
         _handle_topic_request(cur, chat_id, text, client, topic=payload)
     else:
