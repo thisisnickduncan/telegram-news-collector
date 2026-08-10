@@ -16,6 +16,7 @@ from news_alert.dedupe import dedupe_articles
 from news_alert.deep_dive import consume, pending_story_ids, record_digest
 from news_alert.digest import compose_digest
 from news_alert.fetcher import fetch_all
+from news_alert.relevance import topic_score
 from news_alert.sources import count_independent
 from news_alert.summarizer import expand_story, summarize_pending_stories
 from news_alert.telegram_client import safe_call, send_message
@@ -84,9 +85,12 @@ def _rank_candidates(cur, max_stories, min_sources):
     run-scoped test could never deliver it even after a second outlet corroborated it;
     keying off delivered_at is what lets a held story graduate into a later digest.
 
-    Ranked by how many outlets carried it rather than by recency. Within a 4-hour window
-    everything is about equally fresh, so recency effectively sorts by primary key --
-    which once put a 2-source celebrity item above a 9-source Strait of Hormuz story.
+    Ranked by topicality first, then by how many outlets carried it, and only then by
+    recency. Recency is the weakest of the three: within a 4-hour window everything is
+    about equally fresh, so it effectively sorts by primary key -- which once put a
+    2-source celebrity item above a 9-source Strait of Hormuz story. Topicality leads
+    because GDELT matches a query anywhere in an article's text, so a well-sourced story
+    can be well-sourced about something you never asked for (see relevance.py).
 
     Distinct domains is only a cheap SQL prefilter. It can't tell an independent report
     from a syndicated reprint, and on real data that difference is the whole ballgame:
@@ -98,7 +102,7 @@ def _rank_candidates(cur, max_stories, min_sources):
     # have since earned real corroboration. COALESCE defaults legacy rows (sent before
     # this column existed) to "fully delivered" so a deploy doesn't resurface history.
     cur.execute(
-        """SELECT s.id AS id, s.delivered_at AS delivered_at,
+        """SELECT s.id AS id, s.delivered_at AS delivered_at, s.topic AS topic,
                   COUNT(DISTINCT ss.domain) AS domains, MAX(ss.fetched_at) AS latest
            FROM stories s JOIN story_sources ss ON ss.story_id = s.id
            WHERE s.status != 'expired'
@@ -115,23 +119,29 @@ def _rank_candidates(cur, max_stories, min_sources):
         if row["domains"] < min_sources:
             # Two articles from one outlet is still one outlet -- no lookup needed.
             voices = 1
+            on_topic = 0
         else:
             cur.execute(
                 "SELECT title, domain, bias_rating FROM story_sources WHERE story_id = ?",
                 (row["id"],),
             )
-            voices = count_independent(cur.fetchall())
+            sources = cur.fetchall()
+            voices = count_independent(sources)
+            on_topic = topic_score(row["topic"], [s["title"] for s in sources])
 
         if voices >= min_sources:
-            strong.append((voices, row["latest"], row["id"]))
+            strong.append((on_topic, voices, row["latest"], row["id"]))
             if row["delivered_at"] is not None:
                 graduated.add(row["id"])
         elif row["delivered_at"] is None:
             weak.append((row["latest"], row["id"]))
 
+    # Topicality outranks source count: a story genuinely about what you asked for beats
+    # a better-sourced one that merely mentioned it. Ranking rather than filtering --
+    # see relevance.py for why gating on this would starve the digest.
     strong.sort(reverse=True)
     weak.sort(reverse=True)
-    corroborated = [story_id for _, _, story_id in strong]
+    corroborated = [story_id for _, _, _, story_id in strong]
     held = len(weak)
 
     selected = corroborated[:max_stories]
