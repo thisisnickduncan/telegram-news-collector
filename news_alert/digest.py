@@ -209,7 +209,7 @@ def _update_message(cur, story_id):
     }
 
 
-def compose_digest(cur, story_ids, update_ids=(), deep_dive_ids=(), now=None, overflow=0,
+def compose_digest(cur, story_ids, update_ids=(), deep_dive_ids=(), now=None,
                    uncorroborated_ids=(), graduated_ids=()):
     """Builds {"messages": [...], "story_ids": [...]} or None if there's nothing to send.
 
@@ -256,10 +256,11 @@ def compose_digest(cur, story_ids, update_ids=(), deep_dive_ids=(), now=None, ov
     if len(messages) == 1:
         return None
 
-    if overflow > 0:
-        messages.append({"text": f"+{overflow} more this cycle — refine your topics to narrow it down.",
-                         "reply_markup": None})
-
+    # No "+N more this cycle" line. The stories that don't fit cleared exactly the same
+    # bar as the ones that did, so the count invited you to go looking for something you
+    # can't reach, and its advice -- narrow your topics -- was wrong: the binding
+    # constraint is the per-digest cap, not the breadth of the search. The number is
+    # still logged for tuning that cap.
     messages.append({"text": FOLLOW_UP_PROMPT, "reply_markup": None})
 
     for i, message in enumerate(messages):

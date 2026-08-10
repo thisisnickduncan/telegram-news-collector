@@ -240,7 +240,7 @@ def run(send_at=None):
     # the time it happened to finish composing.
     with db_cursor() as cur:
         digest = compose_digest(cur, ordered, update_ids=update_ids,
-                                deep_dive_ids=deep_dive_ids, now=send_at, overflow=overflow,
+                                deep_dive_ids=deep_dive_ids, now=send_at,
                                 uncorroborated_ids=plan["uncorroborated"],
                                 graduated_ids=plan["graduated"])
 
