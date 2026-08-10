@@ -16,9 +16,35 @@ So sources are grouped by near-identical headline and each group votes once. Two
 outlets that wrote their own headline about the same event are two voices; nine
 outlets running the same headline are one.
 """
+import re
+
 from rapidfuzz import fuzz
 
 from news_alert.dedupe import normalize_title
+
+# Trailing masthead: "Art the Clown takes over Universal Terror Tram – Press Telegram".
+# Publisher groups syndicate one article across their whole chain and each paper appends
+# its own name, which is enough to drag five identical copies from ~100 down to 75 --
+# under the syndication threshold, so they counted as five independent outlets and
+# manufactured a coverage spread out of one article. Stripping the masthead first puts
+# them back at ~100 where they belong.
+#
+# Only en/em dash, pipe and underscore are treated as masthead separators. A plain
+# hyphen is excluded on purpose: GDELT pads punctuation with spaces, so real headline
+# text routinely contains " - " ("coming - of - age").
+_MASTHEAD_RE = re.compile(r"\s[–—|_]\s+[^–—|_]{1,40}$")
+
+
+def grouping_key(title):
+    """Normalized headline with any trailing masthead removed, for syndication compare."""
+    text = title or ""
+    # Loop: some feeds carry two ("... _ 新闻频道 _ 中华网").
+    for _ in range(3):
+        stripped = _MASTHEAD_RE.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
+    return normalize_title(text)
 
 # Headlines at or above this similarity are treated as the same piece of copy.
 # Deliberately high: the goal is catching republished copy, not merging two outlets'
@@ -45,7 +71,7 @@ def group_sources(rows):
     for row in rows:
         if not row["title"]:
             continue
-        normalized = normalize_title(row["title"])
+        normalized = grouping_key(row["title"])
         for group in groups:
             if fuzz.token_sort_ratio(normalized, group["key"]) >= SYNDICATION_THRESHOLD:
                 group["rows"].append(row)
