@@ -4,7 +4,7 @@ One query per (topic, region) pair against https://api.gdeltproject.org/api/v2/d
 Region filtering uses GDELT's `sourcecountry:` operator, which takes FIPS 10-4
 two-letter codes (NOT ISO 3166 -- e.g. Germany is GM, not DE; Australia is AS, not AU).
 Only a small, deliberately incomplete set of countries is mapped below. A region that
-isn't a recognized country (e.g. "Hawaii", a US state) is folded into the query as a
+isn't a recognized country (e.g. "Your Town", a US city) is folded into the query as a
 plain keyword term instead of guessed at as a country code -- narrower results, but
 not silently wrong. See plan section 11 for the same philosophy applied to bias ratings.
 """

@@ -16,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from news_alert.db import db_cursor
 
-PLACEHOLDER_TOPICS = ["ai regulation", "cybersecurity", "hawaii politics"]
-PLACEHOLDER_REGIONS = ["US", "Global", "Hawaii"]
+PLACEHOLDER_TOPICS = ["ai regulation", "cybersecurity", "your town politics"]
+PLACEHOLDER_REGIONS = ["US", "Global", "Your Town"]
 
 
 def split_list(value):
@@ -46,7 +46,7 @@ def main():
     parser.add_argument("--show", action="store_true", help="Print current preferences and exit")
     parser.add_argument("--seed-placeholders", action="store_true", help="Seed placeholder topics/regions from the plan doc (only fills fields not already set)")
     parser.add_argument("--topics", help="Comma-separated list, e.g. 'ai regulation,cybersecurity'")
-    parser.add_argument("--regions", help="Comma-separated list, e.g. 'US,Global,Hawaii'")
+    parser.add_argument("--regions", help="Comma-separated list, e.g. 'US,Global,Your Town'")
     parser.add_argument("--keywords", help="Comma-separated list of extra filter terms")
     parser.add_argument("--excluded-sources", help="Comma-separated list of domains to skip")
     parser.add_argument("--max-stories", type=int, help="Cap on stories per digest")

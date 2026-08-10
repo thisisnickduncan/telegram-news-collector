@@ -2,8 +2,8 @@
 CREATE TABLE IF NOT EXISTS preferences (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     telegram_chat_id TEXT,            -- captured once, when you /start the bot (register_bot.py)
-    topics TEXT NOT NULL,             -- JSON array, e.g. ["ai regulation","cybersecurity","hawaii politics"]
-    regions TEXT NOT NULL,            -- JSON array, e.g. ["US","Global","Hawaii"]
+    topics TEXT NOT NULL,             -- JSON array, e.g. ["ai regulation","cybersecurity","your town politics"]
+    regions TEXT NOT NULL,            -- JSON array, e.g. ["US","Global","Your Town"]
     keywords TEXT,                    -- JSON array, extra filter terms
     excluded_sources TEXT,            -- JSON array of domains to skip
     digest_max_stories INTEGER DEFAULT 6,
