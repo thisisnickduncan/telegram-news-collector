@@ -24,9 +24,21 @@ import time
 import requests
 
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
-REQUEST_DELAY_SECONDS = 15.0
-MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 20.0
+
+# GDELT asks for "one request every 5 seconds"; 6s keeps us clear of that for both
+# spacing between searches and spacing between retries of the same search.
+#
+# The retry budget is deliberately "many attempts, short flat waits" rather than the
+# usual few-attempts-with-escalating-backoff. Escalating backoff assumes a 429 means
+# *you* are going too fast, so waiting longer helps. Measured against GDELT, that's
+# not what's happening: 10 identical requests at 6s spacing from an otherwise idle
+# host returned nine 429s and one 200, and a first request after minutes of silence
+# still 429s. The API is simply saturated and answers probabilistically, so a longer
+# wait is no likelier to succeed than a short one -- it just stalls the run. Extra
+# attempts raise the odds a given topic lands at all; longer waits only cost time.
+REQUEST_DELAY_SECONDS = 6.0
+MAX_RETRIES = 6
+RETRY_BACKOFF_SECONDS = 6.0
 GLOBAL_REGION = "GLOBAL"
 
 # FIPS 10-4 country codes for GDELT's sourcecountry: operator.
@@ -87,14 +99,18 @@ def _build_query(term, region=None, keywords=None, excluded_sources=None):
 
 
 def _get_with_retry(http, params, label):
-    """GDELT 429s in practice even at conservative request rates -- back off and retry."""
+    """GDELT 429s constantly regardless of how politely we ask -- just keep trying.
+
+    The wait is flat, not escalating: see REQUEST_DELAY_SECONDS above for the
+    measurements showing these 429s are saturation, not rate-limiting of us.
+    """
     resp = http.get(GDELT_URL, params=params, timeout=30)
     attempt = 0
     while resp.status_code == 429 and attempt < MAX_RETRIES:
         attempt += 1
-        wait = RETRY_BACKOFF_SECONDS * attempt
-        print(f"[fetcher] 429 for {label}, retry {attempt}/{MAX_RETRIES} in {wait:.0f}s")
-        time.sleep(wait)
+        print(f"[fetcher] 429 for {label}, retry {attempt}/{MAX_RETRIES} in "
+              f"{RETRY_BACKOFF_SECONDS:.0f}s")
+        time.sleep(RETRY_BACKOFF_SECONDS)
         resp = http.get(GDELT_URL, params=params, timeout=30)
     return resp
 
