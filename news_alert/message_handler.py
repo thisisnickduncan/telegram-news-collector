@@ -32,7 +32,7 @@ if __package__ in (None, ""):
 from news_alert.config import ANTHROPIC_API_KEY
 from news_alert.deep_dive import last_digest_stories
 from news_alert.digest import deep_dive_message
-from news_alert.mutes import active_rules, deactivate_rule
+from news_alert.mutes import active_rules, deactivate_rule, refine_rule
 from news_alert.summarizer import expand_story
 from news_alert.telegram_client import safe_call, send_message
 
@@ -40,6 +40,12 @@ from news_alert.telegram_client import safe_call, send_message
 # search -- the most expensive thing the system does -- and "all of them" on a ten-story
 # digest should not quietly spend ten of them.
 MAX_IMMEDIATE_EXPANSIONS = 3
+
+# How long the "why did you ignore that?" question stays the meaning of your next
+# message. Past this it lapses, because an unanswered question left pending forever would
+# eventually eat an unrelated message -- somebody asking to track a new topic two days
+# later would have it filed as a reason for a mute they'd forgotten about.
+WHY_TIMEOUT_MINUTES = 60
 
 # Only phrasings that can mean nothing else. "show me 3" deliberately does NOT match:
 # the digest ends by asking which stories you want more on, so a bare number after a
@@ -214,13 +220,58 @@ def _list_mutes(cur, chat_id):
                   "mute it, or mute stories like it.", parse_mode=None)
         return
 
-    lines = "\n".join(f"{row['id']}. {row['rule']}" for row in rules)
+    lines = "\n".join(
+        f"{row['id']}. {row['rule']}" + (f" — you said: {row['reason']}" if row["reason"] else "")
+        for row in rules
+    )
     safe_call(
         send_message, chat_id,
         f"You're ignoring:\n{lines}\n\nReply \"unmute {rules[0]['id']}\" (with the number) "
         f"to start seeing one of these again.",
         parse_mode=None,
     )
+
+
+def _why_is_live(pending_at):
+    """Whether an outstanding "why?" is recent enough to claim the next message."""
+    if not pending_at:
+        return False
+    try:
+        asked = datetime.fromisoformat(pending_at)
+    except (TypeError, ValueError):
+        return False
+    if asked.tzinfo is None:
+        asked = asked.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - asked).total_seconds() / 60
+    return age <= WHY_TIMEOUT_MINUTES
+
+
+def _handle_why(cur, chat_id, rule_id, reason, client):
+    """Takes the user's answer to "what is it you'd rather not see?" and rewrites the rule.
+
+    The rule has been in force since the button press, so this can only improve it -- and
+    the reason is stored with it, so every later screening call is judged against the
+    user's own words instead of one guess made from one headline.
+    """
+    cur.execute("UPDATE preferences SET pending_why_rule_id = NULL, "
+                "pending_why_at = NULL WHERE id = 1")
+
+    result = refine_rule(cur, rule_id, client=client, reason=reason)
+    if result is None:
+        # Un-muted between the question and the answer.
+        safe_call(send_message, chat_id,
+                  "That one's already un-ignored, so there's nothing to apply that to.",
+                  parse_mode=None)
+        return
+
+    old_rule, new_rule = result
+    if new_rule != old_rule:
+        body = (f"Noted — I've changed that to {new_rule}, and I'll keep your reason in "
+                f'mind on the close calls. "unmute {rule_id}" undoes it.')
+    else:
+        body = (f"Noted — I'll keep that in mind when I'm deciding what counts as "
+                f'{new_rule}. "unmute {rule_id}" undoes it.')
+    safe_call(send_message, chat_id, body, parse_mode=None)
 
 
 def _handle_unmute(cur, chat_id, rule_id):
@@ -322,19 +373,31 @@ def handle_message(cur, message, client=None):
     if not text:
         return
 
-    cur.execute("SELECT pending_ask_story_id FROM preferences WHERE id = 1")
+    cur.execute("SELECT pending_ask_story_id, pending_why_rule_id, pending_why_at "
+                "FROM preferences WHERE id = 1")
     row = cur.fetchone()
     if row is None:
         print(f"[message_handler] no preferences row -- ignoring message from chat_id={chat_id}")
         return
 
     print(f"[message_handler] received {text!r} from chat_id={chat_id}, "
-          f"pending_ask_story_id={row['pending_ask_story_id']}")
+          f"pending_ask_story_id={row['pending_ask_story_id']}, "
+          f"pending_why_rule_id={row['pending_why_rule_id']}")
 
     # An explicit Ask button press wins outright -- you told us what you meant.
     if row["pending_ask_story_id"] is not None:
         _answer_story_question(cur, chat_id, row["pending_ask_story_id"], text, client)
         return
+
+    # Same reasoning one step down: we asked a direct question a moment ago, so this is
+    # the answer to it. Ask still outranks it -- that's a deliberate button press, while
+    # this is a question the bot volunteered and the user may well be ignoring.
+    if row["pending_why_rule_id"] is not None:
+        if _why_is_live(row["pending_why_at"]):
+            _handle_why(cur, chat_id, row["pending_why_rule_id"], text, client)
+            return
+        cur.execute("UPDATE preferences SET pending_why_rule_id = NULL, "
+                    "pending_why_at = NULL WHERE id = 1")
 
     # "unmute 3" is unambiguous, so it's matched here rather than spending a
     # classification call on it -- and a classifier can't be trusted with the number.

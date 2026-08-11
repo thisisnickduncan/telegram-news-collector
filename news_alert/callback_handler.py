@@ -17,7 +17,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from news_alert.digest import ignore_choice_keyboard, story_keyboard
+from news_alert.digest import ignore_choice_keyboard, story_keyboard, why_keyboard
 from news_alert.mutes import add_rule, deactivate_rule_for_story, describe_rule
 from news_alert.telegram_client import (
     answer_callback_query,
@@ -26,7 +26,9 @@ from news_alert.telegram_client import (
     send_message,
 )
 
-CALLBACK_RE = re.compile(r"^(follow|stop|ask|ignore|mute1|mutetype|keep|unmute):(\d+)$")
+CALLBACK_RE = re.compile(
+    r"^(follow|stop|ask|ignore|mute1|mutetype|keep|unmute|whyskip):(\d+)$"
+)
 
 
 def _set_keyboard(callback_query, markup):
@@ -52,10 +54,19 @@ def handle_callback_query(cur, callback_query):
         safe_call(answer_callback_query, callback_query["id"], text="Unrecognized button.")
         return
 
+    # The trailing number is a story id for every action but whyskip, where it's the id of
+    # the mute rule whose "why?" question is being dismissed.
     action, story_id = match.group(1), int(match.group(2))
-    print(f"[callback_handler] action={action!r} story_id={story_id}")
+    print(f"[callback_handler] action={action!r} id={story_id}")
     now = datetime.now(timezone.utc).isoformat()
     chat_id = callback_query["message"]["chat"]["id"]
+
+    if action == "whyskip":
+        cur.execute("UPDATE preferences SET pending_why_rule_id = NULL, "
+                    "pending_why_at = NULL WHERE id = 1")
+        safe_call(answer_callback_query, callback_query["id"], text="No problem.")
+        _set_keyboard(callback_query, {"inline_keyboard": []})
+        return
 
     if action == "follow":
         cur.execute(
@@ -130,12 +141,29 @@ def handle_callback_query(cur, callback_query):
 
         # Say the rule out loud. A filter you can't see is one you can't correct, and
         # this one deletes things before you ever learn they existed.
-        if created:
-            body = (f'Got it — I\'ll stop showing stories about {rule}.\n\n'
-                    f'Say "what am I ignoring" to review, or "unmute {rule_id}" to undo.')
-        else:
-            body = f'Already ignoring stories about {rule}.'
-        safe_call(send_message, chat_id, body, parse_mode=None)
+        if not created:
+            safe_call(send_message, chat_id,
+                      f'Already ignoring stories about {rule}.', parse_mode=None)
+            return
+
+        # Then ask why -- but only after the rule is already in force, so an unanswered
+        # question costs nothing. The category was guessed from a single headline, and
+        # the headline cannot say whether "no more Powerball" means lotteries or means
+        # gambling. The answer rewrites the rule and is kept alongside it, so every later
+        # screening decision sees the user's own words rather than one inference from one
+        # example. See mutes.refine_rule.
+        cur.execute(
+            "UPDATE preferences SET pending_why_rule_id = ?, pending_why_at = ? WHERE id = 1",
+            (rule_id, now),
+        )
+        safe_call(
+            send_message, chat_id,
+            f"Got it — I'll stop showing stories about {rule}.\n\n"
+            f"What is it you'd rather not see? A few words is plenty, and it'll make me "
+            f"better at judging the next one. Or skip and I'll go with what I've got.\n\n"
+            f'(Say "what am I ignoring" to review, or "unmute {rule_id}" to undo.)',
+            reply_markup=why_keyboard(rule_id), parse_mode=None,
+        )
 
     elif action == "unmute":
         cur.execute("UPDATE stories SET status = 'active' WHERE id = ?", (story_id,))

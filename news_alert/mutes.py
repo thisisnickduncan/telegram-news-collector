@@ -51,7 +51,13 @@ RULE_SYSTEM = (
     "drawing on monday\" is too narrow to ever match again; \"news\" is so broad it "
     "would mute everything. When in doubt err narrow: a rule that is too tight only "
     "means they mute a second time, while one that is too loose silently deletes things "
-    "they wanted and they never find out."
+    "they wanted and they never find out.\n\n"
+    "If the user says WHY they don't want it, that reason -- not the story -- is what "
+    "you are naming. The story is one example of what they're tired of; their words say "
+    "what the boundary actually is. \"I don't care about gambling\" from a Powerball "
+    "story means \"gambling and betting\", not \"lottery jackpots\". \"Too depressing\" "
+    "from a shooting story means violent crime coverage, not that one city. Where the "
+    "reason contradicts the obvious reading of the story, follow the reason."
 )
 
 MATCH_SYSTEM = (
@@ -66,7 +72,13 @@ MATCH_SYSTEM = (
     "to it, or sharing a subject with it, is not enough -- if the user muted \"lottery "
     "jackpots and prize drawings\", a story about lottery funding legislation is NOT a "
     "match. A wrongly filtered story disappears without the user ever knowing it "
-    "existed, so when a headline is ambiguous, leave it out."
+    "existed, so when a headline is ambiguous, leave it out.\n\n"
+    "Some rules come with the user's own words about why they muted it, shown as "
+    "(reason: ...). Those words are the boundary -- they say what the user is actually "
+    "avoiding, which the category name can only approximate. Use them to settle the "
+    "ambiguous cases in both directions: a headline the reason plainly covers is a "
+    "match even if the category name is a loose fit, and one the reason plainly does "
+    "not cover is not a match even if the name would catch it."
 )
 
 _MATCH_RE = re.compile(r"^\s*(\d+)\s*[:.\)-]\s*R(\d+)\s*$", re.IGNORECASE)
@@ -76,17 +88,28 @@ def _client(client=None):
     return client or anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
-def describe_rule(headline, summary=None, client=None):
-    """Turns the story you were looking at into a reusable category. None if it fails."""
+def describe_rule(headline, summary=None, client=None, reason=None):
+    """Turns the story you were looking at into a reusable category. None if it fails.
+
+    `reason` is the user's own answer to "why?", asked after the rule is already in
+    force. It is the difference between a category guessed from one example and one the
+    user actually stated -- the same Powerball story means "lottery jackpots" to someone
+    bored of lotteries and "gambling and betting" to someone avoiding gambling, and
+    nothing in the headline distinguishes those.
+    """
     body = (summary or headline or "").strip()
     if not body:
         return None
+
+    content = f"Story: {body}"
+    if reason:
+        content += f"\n\nUser's reason for muting it: {reason.strip()}"
 
     response = _client(client).messages.create(
         model=MODEL,
         max_tokens=40,
         system=RULE_SYSTEM,
-        messages=[{"role": "user", "content": f"Story: {body}"}],
+        messages=[{"role": "user", "content": content}],
     )
     rule = next((b.text for b in response.content if b.type == "text"), "").strip()
     rule = rule.strip("\"'.").lower()
@@ -99,7 +122,7 @@ def describe_rule(headline, summary=None, client=None):
     return rule
 
 
-def add_rule(cur, rule, story_id=None, headline=None):
+def add_rule(cur, rule, story_id=None, headline=None, reason=None):
     """Stores a rule, or returns the existing id if that category is already muted."""
     cur.execute("SELECT id FROM mute_rules WHERE active = 1 AND LOWER(rule) = ?", (rule.lower(),))
     existing = cur.fetchone()
@@ -107,15 +130,58 @@ def add_rule(cur, rule, story_id=None, headline=None):
         return existing["id"], False
 
     cur.execute(
-        """INSERT INTO mute_rules (rule, source_story_id, source_headline, created_at, active)
-           VALUES (?, ?, ?, ?, 1)""",
-        (rule, story_id, headline, datetime.now(timezone.utc).isoformat()),
+        """INSERT INTO mute_rules
+           (rule, source_story_id, source_headline, reason, created_at, active)
+           VALUES (?, ?, ?, ?, ?, 1)""",
+        (rule, story_id, headline, reason, datetime.now(timezone.utc).isoformat()),
     )
     return cur.lastrowid, True
 
 
+def refine_rule(cur, rule_id, client=None, reason=None):
+    """Re-derives a rule now that the user has said why, and stores the reason.
+
+    Returns (old_rule, new_rule) -- equal when the reason didn't change the category,
+    which is the common case and is not a failure. Returns None if the rule is gone.
+
+    The rule is rewritten rather than added alongside: the reason is a correction to the
+    guess made from one headline, and keeping both would leave the original over- or
+    under-broad rule quietly filtering as well.
+    """
+    cur.execute(
+        "SELECT rule, source_story_id, source_headline FROM mute_rules "
+        "WHERE id = ? AND active = 1",
+        (rule_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+
+    old_rule = row["rule"]
+    refined = describe_rule(row["source_headline"], client=client, reason=reason)
+    new_rule = refined or old_rule
+
+    # A refinement that collides with a rule the user already has would create a
+    # duplicate category; keep the reason on this row and leave the text alone.
+    if new_rule.lower() != old_rule.lower():
+        cur.execute(
+            "SELECT id FROM mute_rules WHERE active = 1 AND LOWER(rule) = ? AND id != ?",
+            (new_rule.lower(), rule_id),
+        )
+        if cur.fetchone():
+            new_rule = old_rule
+
+    cur.execute("UPDATE mute_rules SET rule = ?, reason = ? WHERE id = ?",
+                (new_rule, reason, rule_id))
+    if new_rule != old_rule:
+        print(f"[mutes] rule {rule_id} refined by reason {reason!r}: "
+              f"{old_rule!r} -> {new_rule!r}")
+    return old_rule, new_rule
+
+
 def active_rules(cur):
-    cur.execute("SELECT id, rule, source_headline, created_at FROM mute_rules WHERE active = 1 ORDER BY id")
+    cur.execute("SELECT id, rule, reason, source_headline, created_at "
+                "FROM mute_rules WHERE active = 1 ORDER BY id")
     return cur.fetchall()
 
 
@@ -165,7 +231,10 @@ def muted_story_ids(cur, candidates, client=None):
     if not rules:
         return set()
 
-    rule_lines = "\n".join(f"R{i}: {row['rule']}" for i, row in enumerate(rules, start=1))
+    rule_lines = "\n".join(
+        f"R{i}: {row['rule']}" + (f"  (reason: {row['reason']})" if row["reason"] else "")
+        for i, row in enumerate(rules, start=1)
+    )
     muted = set()
 
     for start in range(0, len(candidates), MAX_STORIES_PER_CALL):

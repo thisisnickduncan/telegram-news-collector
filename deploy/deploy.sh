@@ -3,7 +3,7 @@
 #
 # Usage:
 #   NEWS_ALERT_HOST=opc@203.0.113.10 ./deploy/deploy.sh
-#   ./deploy/deploy.sh --migrate          # also run scripts/migrate_v2.py
+#   ./deploy/deploy.sh --migrate          # also run every scripts/migrate_*.py in order
 #   ./deploy/deploy.sh --seed-bias        # also refresh the AllSides/MBFC bias data
 #
 # Connection settings come from the environment, or from deploy/target.env if that

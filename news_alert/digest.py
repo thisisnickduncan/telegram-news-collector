@@ -45,11 +45,38 @@ def _safe_url(url):
     return cleaned if cleaned.lower().startswith(SAFE_URL_SCHEMES) else None
 
 FOLLOW_UP_PROMPT = (
-    "\U0001F5E3 Want more on any of these?\n"
-    "Reply naming them however you like -- \"the Iran one and the cyber story\" is fine, "
-    "and I'll dig in and send it straight back. No rush either: this digest stays the "
-    "one I'm matching against until the next one goes out."
+    "\U0001F5E3 Let me know if there is a particular story you would like for me to "
+    "take a look at for the next digest."
 )
+
+# Drawn under the digest header. Telegram has no rule element and no heading level, so a
+# run of box-drawing characters is the only separator available; kept short enough not to
+# wrap on a narrow phone.
+DIVIDER = "━" * 18
+
+# Subject chips. GDELT search terms are free text, so most won't match anything here and
+# fall back to the neutral pin -- that's fine. The point is that recurring subjects get a
+# consistent glyph, not that every subject gets a clever one.
+TOPIC_ICONS = (
+    (("war", "military", "strike", "missile", "troops", "conflict", "invasion"), "\U0001F6E1"),
+    (("cyber", "hack", "ransomware", "breach", "malware"), "\U0001F510"),
+    (("election", "senate", "congress", "parliament", "politic", "vote", "campaign"), "\U0001F5F3"),
+    (("court", "lawsuit", "trial", "ruling", "judge", "legal", "indict"), "\U00002696"),
+    (("ai ", "artificial intelligence", "tech", "software", "chip", "semiconductor"), "\U0001F916"),
+    (("econom", "market", "inflation", "fed ", "rate", "trade", "tariff", "business"), "\U0001F4C8"),
+    (("climate", "weather", "storm", "hurricane", "wildfire", "flood", "quake"), "\U0001F326"),
+    (("health", "disease", "outbreak", "vaccine", "hospital", "drug"), "\U0001FA7A"),
+    (("space", "nasa", "rocket", "satellite"), "\U0001F680"),
+)
+DEFAULT_TOPIC_ICON = "\U0001F4CC"
+
+
+def _topic_icon(topic):
+    text = f" {(topic or '').lower()} "
+    for keywords, icon in TOPIC_ICONS:
+        if any(keyword in text for keyword in keywords):
+            return icon
+    return DEFAULT_TOPIC_ICON
 
 
 def story_keyboard(story_id, following=False, muted=False):
@@ -94,10 +121,27 @@ def ignore_choice_keyboard(story_id):
     ]}
 
 
+def why_keyboard(rule_id):
+    """Offered alongside the "why?" question after muting a category.
+
+    The question is worth asking -- the reason is what separates "no more lottery" from
+    "no more gambling of any kind" -- but it must never be a gate. The rule is already
+    live by the time this appears, so skipping costs the user nothing.
+    """
+    return {"inline_keyboard": [[
+        {"text": "Skip", "callback_data": f"whyskip:{rule_id}"},
+    ]]}
+
+
 def _format_time(now):
     hour = now.hour % 12 or 12
     ampm = "am" if now.hour < 12 else "pm"
     return f"{hour}:{now.strftime('%M')}{ampm}"
+
+
+def _format_date(now):
+    # Not %-d/%#d: the format differs between glibc and Windows and this renders on both.
+    return f"{now:%a} {now.day} {now:%b}"
 
 
 def _escape(text):
@@ -140,6 +184,7 @@ def _pick_sources(rows):
 
 
 def _source_links(cur, story_id):
+    """(rendered links line, number of independent voices behind the story)."""
     cur.execute(
         """SELECT title, url, domain, outlet_name, bias_rating FROM story_sources
            WHERE story_id = ? AND url IS NOT NULL""",
@@ -147,7 +192,7 @@ def _source_links(cur, story_id):
     )
     picked, total = _pick_sources(cur.fetchall())
     if not picked:
-        return ""
+        return "", total
 
     links = []
     for row in picked:
@@ -158,11 +203,17 @@ def _source_links(cur, story_id):
     line = " · ".join(links)
     if total > len(picked):
         line += f" +{total - len(picked)} more"
-    return line
+    return line, total
 
 
-def _coverage_block(cur, story_id):
-    """Bar + counts + overall lean, or "" when no source on the story is rated.
+def _lean_phrase(lean):
+    # "Leans Right" -> "leans Right". The label is a hedge, not a heading, and starting it
+    # with a capital gives it the weight of a verdict it doesn't have.
+    return lean[0].lower() + lean[1:] if lean.startswith("Leans") else lean
+
+
+def _coverage_line(cur, story_id):
+    """Bar + overall lean on one line, or "" when too few sources are rated to say.
 
     Deliberately renders nothing rather than an empty bar or the word "Unrated" --
     an unrated story just doesn't get a coverage line.
@@ -170,13 +221,20 @@ def _coverage_block(cur, story_id):
     coverage = story_coverage(cur, story_id)
     if coverage is None:
         return ""
-    return (f"{coverage['bar']} <b>{_escape(coverage['lean'])}</b>\n"
-            f"Coverage: {_escape(coverage['summary_line'])}")
+    return f"{coverage['bar']}  {_escape(_lean_phrase(coverage['lean']))}"
 
 
-def _story_message(cur, story_id, uncorroborated=False, graduated=False):
+def _subject_chip(topic, voices):
+    """The small line above a story: what it's filed under, and how many newsrooms."""
+    parts = [f"{_topic_icon(topic)} <b>{_escape(topic or 'News')}</b>"]
+    if voices >= 2:
+        parts.append(f"{voices} voices")
+    return "  ·  ".join(parts)
+
+
+def _story_message(cur, story_id, uncorroborated=False):
     cur.execute(
-        "SELECT headline, summary, status FROM stories WHERE id = ?",
+        "SELECT headline, summary, status, topic FROM stories WHERE id = ?",
         (story_id,),
     )
     story = cur.fetchone()
@@ -185,26 +243,29 @@ def _story_message(cur, story_id, uncorroborated=False, graduated=False):
 
     # Prefer the Claude-written summary over the raw (often messily-scraped) headline.
     body = story["summary"] or story["headline"]
+    links, voices = _source_links(cur, story_id)
 
-    parts = []
-    if graduated:
-        # This one was shown before as a single source; other outlets have since picked
-        # it up. Saying so is why seeing it twice isn't confusing.
-        parts.append("\U0001F53A <b>Now corroborated</b>")
-    parts.append(f"<b>{_escape(body)}</b>")
+    # Blockquote rather than bold: Telegram draws it with its own indent and left rule, so
+    # the story text reads as a block of prose instead of a wall of shouted headline, and
+    # the eye can find where one story stops without counting blank lines.
+    parts = [
+        _subject_chip(story["topic"], voices),
+        f"<blockquote>{_escape(body)}</blockquote>",
+    ]
 
-    links = _source_links(cur, story_id)
-    if links:
-        parts.append(links)
-
+    # Sources and sourcing sit together on consecutive lines -- they're one statement
+    # about provenance, and separating them cost a blank line for nothing.
+    footer = [links] if links else []
     if uncorroborated:
         # Sits where the coverage bar would go, because it's the same statement: this is
         # what we know about how well-sourced the story is. Never dressed up as a spread.
-        parts.append("<i>Single source — not yet corroborated.</i>")
+        footer.append("<i>Single source — not yet corroborated.</i>")
     else:
-        coverage = _coverage_block(cur, story_id)
+        coverage = _coverage_line(cur, story_id)
         if coverage:
-            parts.append(coverage)
+            footer.append(coverage)
+    if footer:
+        parts.append("\n".join(footer))
 
     return {
         "text": "\n\n".join(parts),
@@ -227,13 +288,15 @@ def deep_dive_message(cur, story_id):
     if story is None or not story["expanded_summary"]:
         return None
 
-    parts = ["\U0001F50E <b>Deeper coverage</b>", _escape(story["expanded_summary"])]
-    links = _source_links(cur, story_id)
-    if links:
-        parts.append(links)
-    coverage = _coverage_block(cur, story_id)
+    parts = ["\U0001F50E <b>Deeper coverage</b>",
+             f"<blockquote>{_escape(story['expanded_summary'])}</blockquote>"]
+    links, _ = _source_links(cur, story_id)
+    footer = [links] if links else []
+    coverage = _coverage_line(cur, story_id)
     if coverage:
-        parts.append(coverage)
+        footer.append(coverage)
+    if footer:
+        parts.append("\n".join(footer))
 
     return {
         "text": "\n\n".join(parts),
@@ -242,33 +305,52 @@ def deep_dive_message(cur, story_id):
     }
 
 
-def _update_message(cur, story_id):
-    cur.execute("SELECT headline, summary FROM stories WHERE id = ?", (story_id,))
+# How much of the earlier summary is echoed under an update. Enough to place the story
+# without re-reading it; short enough that the new fact is what the eye lands on.
+EARLIER_CHARS = 130
+
+
+def _update_message(cur, story_id, development=None):
+    """A story you've already been sent, coming back because something happened.
+
+    `development` is the one-sentence new fact from developments.py. Without it there is
+    nothing to say that wasn't said last time, so the message renders the old summary and
+    the caller shouldn't have asked -- but it stays honest either way by labelling what
+    the reader was told before.
+    """
+    cur.execute("SELECT headline, summary, status, topic FROM stories WHERE id = ?",
+                (story_id,))
     row = cur.fetchone()
     if row is None:
         return None
-    headline = (row["headline"] or "").strip()
-    blurb = row["summary"] or "new development"
 
-    parts = [f'↻ <b>Update</b> — {_escape(headline)}', _escape(blurb)]
-    links = _source_links(cur, story_id)
-    if links:
-        parts.append(links)
-    coverage = _coverage_block(cur, story_id)
+    told = (row["summary"] or row["headline"] or "").strip()
+    blurb = (development or told or "new development").strip()
+
+    parts = [f"↻ <b>Update</b>  ·  {_escape(row['topic'] or 'News')}",
+             f"<blockquote>{_escape(blurb)}</blockquote>"]
+
+    if development and told:
+        earlier = told if len(told) <= EARLIER_CHARS else told[:EARLIER_CHARS].rstrip() + "…"
+        parts.append(f"<i>Earlier: {_escape(earlier)}</i>")
+
+    links, _ = _source_links(cur, story_id)
+    footer = [links] if links else []
+    coverage = _coverage_line(cur, story_id)
     if coverage:
-        parts.append(coverage)
+        footer.append(coverage)
+    if footer:
+        parts.append("\n".join(footer))
 
-    # An update only exists for a story you follow, so the keyboard is always the
-    # followed variant.
     return {
         "text": "\n\n".join(parts),
-        "reply_markup": story_keyboard(story_id, following=True),
+        "reply_markup": story_keyboard(story_id, following=row["status"] == "followed"),
         "story_id": story_id,
     }
 
 
 def compose_digest(cur, story_ids, update_ids=(), now=None,
-                   uncorroborated_ids=(), graduated_ids=()):
+                   uncorroborated_ids=(), developments=None):
     """Builds {"messages": [...], "story_ids": [...]} or None if there's nothing to send.
 
     story_ids: ordered story ids to show as the body of the digest. The caller decides
@@ -287,26 +369,26 @@ def compose_digest(cur, story_ids, update_ids=(), now=None,
         return None
 
     uncorroborated = set(uncorroborated_ids)
-    graduated = set(graduated_ids)
+    developments = developments or {}
 
     # Must be timezone-aware: the server runs on UTC, so a naive now() would label the
     # 8:00pm Pacific digest "3:00am".
     now = now or datetime.now(ZoneInfo(DISPLAY_TIMEZONE))
 
-    messages = [{"text": f"\U0001F4F0 <b>News — {_format_time(now)}</b>",
+    messages = [{"text": f"\U0001F4F0  <b>News</b>  ·  {_format_date(now)}  ·  "
+                         f"{_format_time(now)}\n{DIVIDER}",
                  "reply_markup": None}]
 
     shown = []
     for story_id in story_ids:
         message = _story_message(cur, story_id,
-                                 uncorroborated=story_id in uncorroborated,
-                                 graduated=story_id in graduated)
+                                 uncorroborated=story_id in uncorroborated)
         if message is not None:
             messages.append(message)
             shown.append(story_id)
 
     for story_id in update_ids:
-        message = _update_message(cur, story_id)
+        message = _update_message(cur, story_id, development=developments.get(story_id))
         if message is not None:
             messages.append(message)
             shown.append(story_id)

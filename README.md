@@ -10,16 +10,19 @@ a follow-up question, answered with live web search, or just message the bot to 
 tracking something new.
 
 ```
-📰 News — 8:00am
+📰  News  ·  Tue 11 Aug  ·  8:00am
+━━━━━━━━━━━━━━━━━━
 
-Iran is demanding additional U.S. concessions as a condition for
-reopening the Strait of Hormuz, according to regional media.
+🛡  Iran war  ·  7 voices
+
+▌ Iran is demanding additional U.S. concessions as a
+▌ condition for reopening the Strait of Hormuz,
+▌ according to regional media.
 
 Reuters · Al Jazeera · Fox News · The Guardian  +3 more
-🟦🟦🟦⬜⬜🟥🟥  Leans Left
-Coverage: 3 Left · 2 Center · 2 Right
+🟦🟦⬜🟥🟥  leans Left
 
-[ Follow ]  [ Ask ]
+[ Follow ]  [ Ask ]  [ Ignore ]
 ```
 
 ---
@@ -143,16 +146,42 @@ flowchart TD
     E --> F{2+ independent voices?}
     F -- no --> G[held for corroboration<br/>next cycle]
     F -- yes --> H[relevance.py<br/>rank by topicality, then voices]
-    H --> I[summarizer.py<br/>synthesize across all sources]
+    H --> M[mutes.py<br/>drop muted categories]
+    M --> N[duplicates.py<br/>drop repeats of each other<br/>and of what was already sent]
+    N --> I[summarizer.py<br/>synthesize across all sources]
     I --> J[digest.py<br/>one message per story + buttons]
     J --> K[hold until the exact hour]
     K --> L[Telegram]
     G -.-> F
+    P[already delivered<br/>+ new coverage] --> Q[developments.py<br/>did anything actually happen?]
+    Q -- yes --> J
+    Q -- no --> R[stays sent, stays silent]
 ```
 
-A story that arrives with one source isn't discarded — it's held, and graduates into a
-later digest if another newsroom picks it up, labelled *"Now corroborated"* so seeing it
-twice isn't confusing.
+A story that arrives with one source isn't discarded — it's held, and ships in a later
+digest once another newsroom picks it up.
+
+### Nothing arrives twice
+
+Two separate mechanisms send you the same story again, and both look like features until
+you're on the receiving end.
+
+The first is structural. Events are grouped **per search term**, because the grouper has
+to be scoped somewhere and cross-topic grouping invites false merges. So one event that
+matches two of your terms is grouped twice, becomes two story rows that can never see each
+other, and both clear the corroboration bar independently. One Powerball drawing went out
+twice in a single digest, worded differently, with different source lists. `duplicates.py`
+catches this at the other end of the pipeline, on the shortlist about to be sent, where
+comparing across topics is cheap — and against what was sent recently, which is the same
+bug spread across digests instead of within one.
+
+The second was a deliberate feature: a story sent with one source came back once it earned
+a second, marked *"Now corroborated"*. That is a fact about our confidence, not about the
+news. From the reading end it is the same story twice. Now a delivered story returns only
+when something **happened** — `developments.py` compares what you were told against what
+has arrived since, and more outlets running the same piece, a recap, or a reaction column
+all count as nothing happening. That gate covers followed stories too: following means you
+want the developments, not a ping every time a wire story is republished.
 
 ## Stack
 
@@ -216,15 +245,18 @@ news_alert/
   sources.py           syndication collapse — the "nine domains, one voice" problem
   relevance.py         topicality scoring used for ranking, never filtering
   bias.py              AllSides + MBFC tagging, coverage spread and overall lean
+  duplicates.py        one event, two search terms, two story rows — caught on the shortlist
+  developments.py      has a story you were already sent actually moved?
+  mutes.py             "stop showing me these", as a category rather than keywords
   summarizer.py        cross-source summaries; deeper briefings via web search
   digest.py            builds the Telegram messages and their inline keyboards
   pipeline.py          orchestrates one run: fetch → … → hold → send
   bot_runner.py        long-poll + scheduler process, with the owner-only gate
   telegram_client.py   thin Bot API wrapper
-  callback_handler.py  Follow / Ask button presses
-  message_handler.py   free-text intent routing: deep dive, new topic, or Q&A
-  deep_dive.py         queues "go deeper on this" requests across cycles
-scripts/               init_db, set_preferences, register_bot, seed_bias_data, migrate_v2
+  callback_handler.py  Follow / Ask / Ignore button presses
+  message_handler.py   free-text intent routing: deep dive, new topic, mute reason, or Q&A
+  deep_dive.py         records what each digest contained, for "the Iran one" to resolve against
+scripts/               init_db, set_preferences, register_bot, seed_bias_data, migrate_v2..v4
 deploy/                systemd unit, journald caps, deploy.sh
 db/schema.sql
 ```

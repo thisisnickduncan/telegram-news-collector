@@ -14,7 +14,9 @@ from news_alert.bias import tag_untagged_sources
 from news_alert.db import get_preferences, db_cursor
 from news_alert.dedupe import dedupe_articles
 from news_alert.deep_dive import record_digest
+from news_alert.developments import pending_developments, record_development
 from news_alert.digest import compose_digest
+from news_alert.duplicates import find_duplicates, mark_duplicates
 from news_alert.fetcher import fetch_all
 from news_alert.mutes import muted_story_ids
 from news_alert.relevance import topic_score
@@ -93,15 +95,22 @@ def _muted_ids(cur, story_ids, client=None):
 def _rank_candidates(cur, max_stories, min_sources, client=None):
     """Works out what this digest should carry.
 
-    Returns {selected, overflow, held, uncorroborated, graduated} where `selected` is
+    Returns {selected, overflow, held, uncorroborated, duplicates} where `selected` is
     already in send order: corroborated stories first, ranked by how many independent
     outlets carried them, then -- only if that came up short of DIGEST_MIN_STORIES --
     the freshest single-source stories as a marked-up floor.
 
-    Eligibility is "not yet delivered AND still fresh", deliberately not "created during
+    Eligibility is "never delivered AND still fresh", deliberately not "created during
     this run". A story created last cycle with one source isn't new any more, so a
     run-scoped test could never deliver it even after a second outlet corroborated it;
-    keying off delivered_at is what lets a held story graduate into a later digest.
+    keying off delivered_at is what lets a held story ship in a later digest.
+
+    A story that HAS been delivered never comes back through here, not even the
+    single-source ones that later earned corroboration. Those used to return marked "Now
+    corroborated", which is a statement about our confidence rather than about the news
+    -- from the reading end it was simply the same story twice. A delivered story now
+    only returns as an update, and only when developments.py finds that something
+    actually happened.
 
     Ranked by topicality first, then by how many outlets carried it, and only then by
     recency. Recency is the weakest of the three: within a 4-hour window everything is
@@ -116,23 +125,22 @@ def _rank_candidates(cur, max_stories, min_sources, client=None):
     affiliates. The real test runs in Python, where headlines can be compared.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=STORY_MAX_AGE_HOURS)).isoformat()
-    # Already-delivered stories come back only if they were sent as single-source and
-    # have since earned real corroboration. COALESCE defaults legacy rows (sent before
-    # this column existed) to "fully delivered" so a deploy doesn't resurface history.
+    # delivered_at IS NULL, full stop. Anything already sent is out of the digest body
+    # for good; see the docstring.
     cur.execute(
         """SELECT s.id AS id, s.delivered_at AS delivered_at, s.topic AS topic,
                   COUNT(DISTINCT ss.domain) AS domains, MAX(ss.fetched_at) AS latest
            FROM stories s JOIN story_sources ss ON ss.story_id = s.id
-           WHERE s.status NOT IN ('expired', 'muted')
-             AND (s.delivered_at IS NULL OR COALESCE(s.delivered_source_count, 99) < ?)
+           WHERE s.status NOT IN ('expired', 'muted', 'duplicate')
+             AND s.delivered_at IS NULL
            GROUP BY s.id
            HAVING MAX(ss.fetched_at) >= ?
            ORDER BY latest DESC""",
-        (min_sources, cutoff),
+        (cutoff,),
     )
     candidates = cur.fetchall()
 
-    strong, weak, graduated = [], [], set()
+    strong, weak = [], []
     for row in candidates:
         if row["domains"] < min_sources:
             # Two articles from one outlet is still one outlet -- no lookup needed.
@@ -149,9 +157,7 @@ def _rank_candidates(cur, max_stories, min_sources, client=None):
 
         if voices >= min_sources:
             strong.append((on_topic, voices, row["latest"], row["id"]))
-            if row["delivered_at"] is not None:
-                graduated.add(row["id"])
-        elif row["delivered_at"] is None:
+        else:
             weak.append((row["latest"], row["id"]))
 
     # Topicality outranks source count: a story genuinely about what you asked for beats
@@ -174,6 +180,18 @@ def _rank_candidates(cur, max_stories, min_sources, client=None):
         weak_ids = [sid for sid in weak_ids if sid not in muted]
         print(f"[pipeline] {len(muted)} candidate(s) dropped by mute rules.")
 
+    # The same event can exist as two story rows -- events.py groups per topic, so a
+    # story matching two of your search terms is grouped twice and never compared across
+    # them. Caught here, on the shortlist, where cross-topic comparison is cheap. Ranking
+    # order decides which copy survives, so this runs after the sort, and the dropped row
+    # is marked so it can't return next run under its own steam.
+    duplicates = find_duplicates(cur, corroborated[:depth] + weak_ids[:depth], client)
+    if duplicates:
+        corroborated = [sid for sid in corroborated if sid not in duplicates]
+        weak_ids = [sid for sid in weak_ids if sid not in duplicates]
+        mark_duplicates(cur, duplicates)
+        print(f"[pipeline] {len(duplicates)} candidate(s) dropped as repeats.")
+
     selected = corroborated[:max_stories]
     overflow = max(len(corroborated) - max_stories, 0)
 
@@ -192,7 +210,7 @@ def _rank_candidates(cur, max_stories, min_sources, client=None):
         "overflow": overflow,
         "held": len(weak_ids) - len(uncorroborated),
         "uncorroborated": uncorroborated,
-        "graduated": graduated,
+        "duplicates": duplicates,
     }
 
 
@@ -227,6 +245,9 @@ def run(send_at=None):
 
     print(f"[pipeline] Fetched {len(articles)} articles. Deduping...")
     results = dedupe_articles(articles)
+    print(f"[pipeline] {sum(1 for r in results if r['action'] == 'new')} new stories, "
+          f"{sum(1 for r in results if r['action'] != 'new')} articles attached to "
+          f"existing ones.")
 
     with db_cursor() as cur:
         tagged = tag_untagged_sources(cur)
@@ -236,9 +257,12 @@ def run(send_at=None):
         plan = _rank_candidates(cur, prefs["digest_max_stories"], MIN_SOURCES)
         selected, overflow, held = plan["selected"], plan["overflow"], plan["held"]
 
-        # Followed stories that picked up something this run still surface as updates,
-        # regardless of the source minimum -- you asked to be told about those.
-        update_ids = sorted({r["story_id"] for r in results if r["action"] == "update"})
+        # A story you've already been sent comes back only when something happened -- not
+        # because more outlets ran it, and not because it finally reached two sources.
+        # This covers followed stories too: following means you want the developments, and
+        # it never meant a ping every time a wire piece was republished.
+        developments = pending_developments(cur, max_age_hours=STORY_MAX_AGE_HOURS)
+        update_ids = [sid for sid in developments if sid not in set(selected)]
 
     # Deep dives used to be queued and led the following digest. They're answered on the
     # spot now (message_handler), so a run has nothing pending to fold in.
@@ -246,10 +270,10 @@ def run(send_at=None):
     corroborated = len(selected) - len(plan["uncorroborated"])
     print(f"[pipeline] {corroborated} corroborated ({MIN_SOURCES}+ independent sources), "
           f"{len(plan['uncorroborated'])} single-source fill, {overflow} overflow, "
-          f"{held} held awaiting corroboration, {len(plan['graduated'])} newly corroborated, "
-          f"{len(update_ids)} followed updates.")
+          f"{held} held awaiting corroboration, {len(plan['duplicates'])} dropped as "
+          f"repeats, {len(update_ids)} developments on stories already sent.")
 
-    print(f"[pipeline] Summarizing {len(ordered)} shown + {len(update_ids)} followed...")
+    print(f"[pipeline] Summarizing {len(ordered)} shown + {len(update_ids)} updates...")
     with db_cursor() as cur:
         summarized = summarize_pending_stories(cur, story_ids=ordered + update_ids)
     print(f"[pipeline] Summarized {summarized} stories.")
@@ -260,11 +284,11 @@ def run(send_at=None):
         digest = compose_digest(cur, ordered, update_ids=update_ids,
                                 now=send_at,
                                 uncorroborated_ids=plan["uncorroborated"],
-                                graduated_ids=plan["graduated"])
+                                developments=developments)
 
     if digest is None:
-        print(f"[pipeline] Nothing corroborated by {MIN_SOURCES}+ sources and no followed "
-              f"updates ({held} stories held). Not sending.")
+        print(f"[pipeline] Nothing corroborated by {MIN_SOURCES}+ sources and no "
+              f"developments ({held} stories held). Not sending.")
         return
 
     if send_at is not None:
@@ -296,11 +320,9 @@ def run(send_at=None):
     uncorroborated = set(plan["uncorroborated"])
     with db_cursor() as cur:
         for story_id, message_id in sent_ids:
-            # delivered_at keeps its first value -- a deep-dive or newly-corroborated
-            # story is being re-shown, and overwriting it would misreport when you first
-            # saw it. delivered_source_count DOES advance: that's the record of what the
-            # story was worth when sent, and raising it is what stops a story that has
-            # now been shown with real corroboration from qualifying to return again.
+            # delivered_at keeps its first value -- an update is a re-show of a story you
+            # already saw, and overwriting it would misreport when you first saw it.
+            # delivered_source_count records what the story was worth when sent.
             cur.execute(
                 """UPDATE stories SET telegram_message_id = ?,
                        delivered_at = COALESCE(delivered_at, ?),
@@ -308,6 +330,10 @@ def run(send_at=None):
                    WHERE id = ?""",
                 (message_id, now, 1 if story_id in uncorroborated else MIN_SOURCES, story_id),
             )
+            # Marking the development as told also moves the watermark the next check
+            # reads from, so this development can't be re-reported next run.
+            if story_id in developments:
+                record_development(cur, story_id, developments[story_id], now)
         # What this digest contained is what a later reply resolves "the Iran one"
         # against, so it has to be recorded even though nothing is queued any more.
         record_digest(cur, [story_id for story_id, _ in sent_ids])

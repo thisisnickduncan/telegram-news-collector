@@ -52,7 +52,10 @@ LEAN_BUCKET = {
 }
 BUCKET_ORDER = ("Left", "Center", "Right")
 BUCKET_BLOCK = {"Left": "\U0001F7E6", "Center": "\U00002B1C", "Right": "\U0001F7E5"}
-BAR_WIDTH = 10
+# Five blocks, not ten. Ten emoji squares wrapped on a narrow phone and read as a chart
+# in their own right; the bar is a glance-level hint next to a one-word lean label, and at
+# five it sits on one line beside it.
+BAR_WIDTH = 5
 
 # Below this many rated voices there's no spread worth drawing -- see story_coverage.
 MIN_RATED_FOR_COVERAGE = 2
